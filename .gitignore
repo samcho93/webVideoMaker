@@ -1,0 +1,6 @@
+node_modules/
+release/
+out/
+*.log
+tests/.tmp/
+.claude/settings.local.json

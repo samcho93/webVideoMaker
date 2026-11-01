@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>WebVideoMaker</title>
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' media: data: blob:; media-src media: blob:; connect-src 'self' media:;">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">▶ WebVideoMaker</div>
+    <div class="group">
+      <button data-cmd="new" title="새 프로젝트 (Ctrl+N)">새로 만들기</button>
+      <button data-cmd="open" title="프로젝트 열기 (Ctrl+O)">열기</button>
+      <button data-cmd="save" title="저장 (Ctrl+S)">저장</button>
+    </div>
+    <div class="group">
+      <button data-cmd="undo" title="실행 취소 (Ctrl+Z)">↶ 취소</button>
+      <button data-cmd="redo" title="다시 실행 (Ctrl+Y)">↷ 다시</button>
+    </div>
+    <div id="projectName" class="project-name"></div>
+    <button id="exportBtn" class="primary" data-cmd="export" title="비디오 내보내기 (Ctrl+E)">비디오 내보내기</button>
+  </header>
+
+  <main id="workspace">
+    <aside id="left">
+      <nav id="tabs">
+        <button data-tab="media" class="active">미디어</button>
+        <button data-tab="text">텍스트</button>
+        <button data-tab="icons">아이콘</button>
+        <button data-tab="captions">자막·나레이션</button>
+        <button data-tab="effects">효과</button>
+      </nav>
+      <div id="tabContent"></div>
+    </aside>
+
+    <section id="center">
+      <div id="stageArea">
+        <div id="stage">
+          <canvas id="preview"></canvas>
+          <div id="stageOverlay"></div>
+        </div>
+      </div>
+      <div id="transport">
+        <span id="timecode" class="timecode">00:00:00:00</span>
+        <div class="group">
+          <button id="btnStart" title="처음으로 (Home)">⏮</button>
+          <button id="btnPrev" title="이전 프레임 (←)">◀︎|</button>
+          <button id="btnPlay" class="play" title="재생/일시정지 (Space)">▶</button>
+          <button id="btnNext" title="다음 프레임 (→)">|▶︎</button>
+          <button id="btnEnd" title="끝으로 (End)">⏭</button>
+        </div>
+        <span id="totalTime" class="timecode dim">00:00:00</span>
+      </div>
+    </section>
+
+    <aside id="right">
+      <h2 id="propTitle">프로젝트 설정</h2>
+      <div id="properties"></div>
+    </aside>
+  </main>
+
+  <section id="timeline">
+    <div id="tlToolbar">
+      <div class="group">
+        <button id="tlSplit" title="재생 위치에서 자르기 (S)">✂ 자르기</button>
+        <button id="tlDelete" title="선택 항목 삭제 (Delete)">삭제</button>
+        <button id="tlRipple" title="삭제 후 뒤 클립을 앞으로 당김 (Shift+Delete)">당겨서 삭제</button>
+        <button id="tlCrossfade" title="앞 클립과 겹쳐서 부드럽게 전환">크로스페이드</button>
+      </div>
+      <div class="group">
+        <button id="tlIn" title="구간 시작 지정 (I)">[ 구간 시작</button>
+        <button id="tlOut" title="구간 끝 지정 (O)">구간 끝 ]</button>
+        <button id="tlClear" title="구간 해제">구간 해제</button>
+        <button id="tlCutRange" title="구간을 모든 트랙에서 잘라내고 뒤를 당김">구간 잘라내기</button>
+      </div>
+      <div class="group">
+        <label>속도
+          <select id="tlSpeed">
+            <option value="0.25">0.25배</option>
+            <option value="0.5">0.5배</option>
+            <option value="1.5">1.5배</option>
+            <option value="2" selected>2배</option>
+            <option value="4">4배</option>
+            <option value="8">8배</option>
+            <option value="16">16배</option>
+          </select>
+        </label>
+        <button id="tlApplySpeed" title="선택 클립의 지정 구간(없으면 클립 전체)에 속도 적용">구간 속도 적용</button>
+      </div>
+      <label class="spacer" title="타임라인 확대/축소 (Ctrl+휠)">확대 <input id="tlZoom" type="range" min="0" max="100" value="45"></label>
+    </div>
+    <div id="tlBody">
+      <div id="tlHeaders"></div>
+      <div id="tlScroll">
+        <div id="tlContent">
+          <div id="tlRuler"><canvas id="tlRulerCanvas"></canvas></div>
+          <div id="tlRows"></div>
+          <div id="tlRange"></div>
+          <div id="tlPlayhead"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toasts"></div>
+
+  <dialog id="exportDialog">
+    <form method="dialog" id="exportForm">
+      <h2>비디오 내보내기</h2>
+      <label>형식
+        <select id="exFormat">
+          <option value="mp4-h264">MP4 (H.264) — 호환성 최고</option>
+          <option value="mp4-h265">MP4 (H.265/HEVC) — 작은 용량</option>
+          <option value="webm">WebM (VP9)</option>
+          <option value="mov">MOV (H.264)</option>
+          <option value="mkv">MKV (H.264)</option>
+          <option value="gif">GIF (소리 없음)</option>
+        </select>
+      </label>
+      <label>해상도
+        <select id="exHeight"></select>
+      </label>
+      <label>화질
+        <select id="exQuality">
+          <option value="high">높음</option>
+          <option value="medium">보통</option>
+          <option value="low">낮음 (빠른 공유)</option>
+        </select>
+      </label>
+      <p id="exInfo" class="dim"></p>
+      <div id="exProgressWrap" hidden>
+        <progress id="exProgress" max="1" value="0"></progress>
+        <div id="exStatus" class="dim"></div>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" id="exClose">닫기</button>
+        <button type="button" id="exReveal" hidden>폴더 열기</button>
+        <button type="button" id="exCancel" hidden>중단</button>
+        <button type="button" id="exStart" class="primary">파일 위치 선택 후 내보내기</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

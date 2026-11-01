@@ -1,0 +1,82 @@
+{
+  "name": "webvideomaker",
+  "productName": "WebVideoMaker",
+  "version": "1.0.0",
+  "description": "Electron 기반 종합 비디오 편집기",
+  "type": "module",
+  "main": "main/main.mjs",
+  "author": "samcho93",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "test:render": "node --test \"tests/render/*.test.mjs\"",
+    "test:e2e": "node tests/e2e/run.mjs",
+    "icon": "node scripts/make-icon.mjs",
+    "dist": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.samcho93.webvideomaker",
+    "productName": "WebVideoMaker",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main/**",
+      "renderer/**",
+      "shared/**",
+      "package.json",
+      "!node_modules/ffprobe-static/bin/darwin/**",
+      "!node_modules/ffprobe-static/bin/linux/**",
+      "!node_modules/ffprobe-static/bin/win32/ia32/**"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**",
+      "node_modules/ffprobe-static/**"
+    ],
+    "fileAssociations": [
+      {
+        "ext": "wvm",
+        "name": "WebVideoMaker Project",
+        "role": "Editor"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "${productName}-${version}-${arch}-${os}-${name}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-Portable-${version}.${ext}"
+    }
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0",
+    "playwright-core": "^1.64.1"
+  }
+}
