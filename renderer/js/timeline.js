@@ -1,6 +1,7 @@
 // 타임라인: 트랙/클립 표시, 끌어서 이동·트림, 자석 맞춤, 재생 위치·구간 표시.
 
 import { findMedia, isMediaClip, itemDuration, itemEnd, MIN_ITEM_DURATION, projectDuration } from '/shared/model.mjs';
+import { trimMaskStart } from '/shared/layout.mjs';
 import { formatHMS } from '/shared/time.mjs';
 import { mediaUrl, store } from './store.js';
 import { el, toast } from './ui.js';
@@ -27,7 +28,7 @@ const trackClass = (track, media) => {
 
 function itemLabel(track, item, media) {
   if (media) return media.name;
-  if (track.type === 'effect') return `${item.effect === 'mosaic' ? '모자이크' : '블러'}${item.animate ? ' (이동)' : ''}`;
+  if (track.type === 'effect') return item.effect === 'mosaic' ? '모자이크' : '블러';
   if (track.type === 'overlay') return item.kind === 'text' ? item.text.split('\n')[0] : item.kind === 'icon' ? `아이콘: ${item.icon}` : '도형';
   return item.text?.split('\n')[0] ?? '';
 }
@@ -348,6 +349,7 @@ export class Timeline {
     if (media && item.speed !== 1) node.append(el('span', { class: 'badge', text: `${item.speed}배속` }));
     if (item.fadeIn > 0) node.append(el('div', { class: 'fade in', style: `width:${item.fadeIn * this.zoom}px` }));
     if (item.fadeOut > 0) node.append(el('div', { class: 'fade out', style: `width:${item.fadeOut * this.zoom}px` }));
+    for (const key of item.keyframes ?? []) node.append(el('i', { class: 'kf', style: `left:${key.t * this.zoom}px` }));
     node.append(el('div', { class: 'trim l' }), el('div', { class: 'trim r' }));
     node.addEventListener('pointerdown', (e) => this.startDrag(e, track, item, node));
     return node;
@@ -506,6 +508,7 @@ export class Timeline {
       }
       store.mutate((p) => {
         const delta = next.start - item.start;
+        if (mode === 'left') trimMaskStart(item, delta);
         Object.assign(item, next.apply);
         // 음성이 연결된 나레이션은 함께 이동한다
         if (mode === 'move' && item.voiceClipId) {

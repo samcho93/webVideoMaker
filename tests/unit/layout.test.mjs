@@ -39,7 +39,7 @@ test('페이드 배율', () => {
 });
 
 test('이동 마스크 위치 보간', () => {
-  const mask = { animate: true, start: 2, duration: 4, x: 0, y: 100, x2: 100, y2: 100 };
+  const mask = { start: 2, duration: 4, x: 0, y: 100, keyframes: [{ t: 0, x: 0, y: 100 }, { t: 4, x: 100, y: 100 }] };
   assert.deepEqual(maskPositionAt(mask, 4), { x: 50, y: 100 });
   assert.deepEqual(maskPositionAt(mask, 99), { x: 100, y: 100 });
 });

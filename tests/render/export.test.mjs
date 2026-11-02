@@ -7,6 +7,7 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { FFMPEG, probe, readJpegOrientation, run, makePeaks, setCacheDir, makePoster, makeProxy, makeSprite, normalizedImage } from '../../main/ffmpeg.mjs';
 import { beginJob, runJob } from '../../main/exporter.mjs';
+import { colorCurveValue, colorMatrix } from '../../shared/layout.mjs';
 import { createMask, createMediaClip, createProject, newId } from '../../shared/model.mjs';
 
 const TMP = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.tmp', 'render');
@@ -204,10 +205,81 @@ test('모자이크·블러는 지정 구간·영역에만 적용된다', async (
 test('타원·이동 모자이크 그래프가 실행된다', async () => {
   const p = createProject();
   track(p, 'V1').clips.push(createMediaClip(media.pattern, 0));
-  const mask = { ...createMask(0, 1920, 1080, 'mosaic', 'ellipse'), x: 100, y: 100, w: 400, h: 400, duration: 5, animate: true, x2: 1400, y2: 600 };
+  const mask = { ...createMask(0, 1920, 1080, 'mosaic', 'ellipse'), x: 100, y: 100, w: 400, h: 400, duration: 5, keyframes: [{ t: 0, x: 100, y: 100 }, { t: 5, x: 1400, y: 600 }] };
   track(p, '모자이크·블러').clips.push(mask);
   const { output } = await render(p, { masks: { [mask.id]: f('ellipse.png') } });
   assert.ok((await probe(output)).duration > 4.8);
+});
+
+test('모자이크는 영상 중간에 기록한 위치로 옮겨 간다', async () => {
+  const edge = (b) => { let acc = 0; for (let i = 1; i < b.length; i += 1) acc += Math.abs(b[i] - b[i - 1]); return acc / b.length; };
+  const makeProject = (motion) => {
+    const p = createProject();
+    track(p, 'V1').clips.push(createMediaClip(media.noise, 0));
+    track(p, '모자이크·블러').clips.push({
+      ...createMask(0, 1920, 1080, 'mosaic'), x: 100, y: 100, w: 320, h: 320, duration: 5, strength: 80, motion,
+      keyframes: [{ t: 0, x: 100, y: 100 }, { t: 2.5, x: 1000, y: 500 }],
+    });
+    return p;
+  };
+  const hold = (await render(makeProject('hold'))).output;
+  const original = edge(await regionGray(hold, 1, 1000, 500, 320, 320));
+  assert.ok(original > 3, `원본 ${original}`);
+  assert.ok(sampleStdDev(await regionGray(hold, 1, 108, 108, 64, 64)) < 4, '기록 전: 처음 자리가 모자이크');
+  assert.ok(edge(await regionGray(hold, 2.3, 100, 100, 320, 320)) < original / 2, '기록 직전까지 처음 자리 유지');
+  assert.ok(sampleStdDev(await regionGray(hold, 3.5, 1008, 508, 64, 64)) < 4, '기록 후: 새 자리가 모자이크');
+  assert.ok(edge(await regionGray(hold, 3.5, 100, 100, 320, 320)) > original / 2, '기록 후: 처음 자리는 원본');
+
+  const linear = (await render(makeProject('linear'))).output;
+  // 1.25초는 두 위치의 중간(550, 300)
+  assert.ok(edge(await regionGray(linear, 1.25, 550, 300, 320, 320)) < original / 2, '중간 시각에는 중간 위치');
+  assert.ok(edge(await regionGray(linear, 1.25, 1400, 700, 320, 320)) > original / 2, '다른 곳은 원본');
+  assert.ok(edge(await regionGray(linear, 4, 1000, 500, 320, 320)) < original / 2, '마지막 기록 뒤에는 그 자리');
+});
+
+test('위치 기록이 많아도 내보낼 수 있다', async () => {
+  const p = createProject();
+  track(p, 'V1').clips.push(createMediaClip(media.pattern, 0));
+  const keyframes = Array.from({ length: 40 }, (_, i) => ({ t: i * 0.12, x: (i * 37) % 1500, y: (i * 53) % 700 }));
+  track(p, '모자이크·블러').clips.push({ ...createMask(0, 1920, 1080, 'blur'), x: 0, y: 0, w: 200, h: 200, duration: 5, keyframes });
+  const { output } = await render(p);
+  assert.ok((await probe(output)).duration > 4.8);
+});
+
+test('영상 조절 결과가 공용 계산식과 일치한다', async () => {
+  const SRC = [0x60, 0x80, 0xa0];
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'color=c=0x6080a0:s=640x360', '-frames:v', '1', '-update', '1', f('solid.png')]);
+  const solid = await register('solid', f('solid.png'));
+  const cases = [
+    { brightness: 0.3 }, { brightness: -0.3 }, { contrast: 0.6 }, { contrast: -0.5 }, { saturation: -1 }, { saturation: 1 },
+    { gamma: 1.8 }, { gamma: 0.6 }, { temperature: 0.8 }, { temperature: -0.8 }, { hue: 90 }, { hue: -120 },
+    { brightness: 0.1, contrast: 0.2, saturation: 0.3, gamma: 1.2, temperature: 0.3, hue: 20 },
+  ];
+  const p = createProject();
+  cases.forEach((patch, i) => {
+    track(p, 'V1').clips.push({ ...createMediaClip(solid, i), out: 1, fit: 'stretch', ...patch });
+  });
+  const { output } = await render(p);
+  for (const [i, patch] of cases.entries()) {
+    const curved = ['r', 'g', 'b'].map((ch, c) => colorCurveValue(patch, ch, SRC[c] / 255));
+    const m = colorMatrix(patch);
+    const expected = [0, 1, 2].map((r) => Math.max(0, Math.min(1, m[r * 3] * curved[0] + m[r * 3 + 1] * curved[1] + m[r * 3 + 2] * curved[2])) * 255);
+    const actual = await pixel(output, i + 0.5, 900, 500);
+    assert.ok(near(actual, expected, 9), `${JSON.stringify(patch)} 기대 ${expected.map(Math.round)} 실제 ${actual}`);
+  }
+  delete media.solid;
+});
+
+test('선명도는 경계를 또렷하게 만들고 알파를 유지한다', async () => {
+  const edge = (b) => { let acc = 0; for (let i = 1; i < b.length; i += 1) acc += Math.abs(b[i] - b[i - 1]); return acc / b.length; };
+  const make = async (sharpness) => {
+    const p = createProject();
+    track(p, 'V1').clips.push({ ...createMediaClip(media.pattern, 0), out: 1, sharpness });
+    return (await render(p)).output;
+  };
+  const plain = edge(await regionGray(await make(0), 0.5, 300, 300, 300, 300));
+  const sharp = edge(await regionGray(await make(1), 0.5, 300, 300, 300, 300));
+  assert.ok(sharp > plain * 1.2, `선명도 ${plain} → ${sharp}`);
 });
 
 test('오버레이 PNG 와 자막 ffconcat', async () => {

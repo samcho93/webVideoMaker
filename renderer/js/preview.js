@@ -1,23 +1,17 @@
 // 미리보기 합성기와 화면 위 직접 조작(이동·크기 조절).
 
-import { computeClipLayout, coverSize, fadeFactor, maskPositionAt } from '/shared/layout.mjs';
+import { computeClipLayout, coverSize, fadeFactor, maskPositionAt, setMaskKeyframe } from '/shared/layout.mjs';
 import { findMedia, itemDuration, itemEnd, projectDuration } from '/shared/model.mjs';
 import { formatFrames, formatHMS } from '/shared/time.mjs';
 import { reportPlaybackError } from './actions.js';
+import { clipFilter } from './colorFilter.js';
 import { mediaUrl, previewPath, store } from './store.js';
 import { rasterizeCaption, rasterizeOverlay } from './raster.js';
 
 const PREROLL = 1.5;
 const DRIFT_PLAYING = 0.3;
 const DRIFT_PAUSED = 0.02;
-
-function clipFilter(clip) {
-  const b = clip.brightness || 0;
-  const c = clip.contrast || 0;
-  const s = clip.saturation || 0;
-  if (!b && !c && !s) return 'none';
-  return `brightness(${1 + b * 0.5}) contrast(${1 + c}) saturate(${1 + s})`;
-}
+const DRAG_THRESHOLD_PX = 3;
 
 export class Preview {
   constructor(canvas) {
@@ -313,7 +307,7 @@ export class Preview {
       ctx.filter = 'blur(30px)';
       ctx.drawImage(source, (W - cover.w) / 2, (H - cover.h) / 2, cover.w, cover.h);
     }
-    ctx.filter = clipFilter(clip);
+    ctx.filter = clipFilter(clip, { sharpen: !this.playing });
     ctx.translate(L.cx, L.cy);
     ctx.rotate((L.angle * Math.PI) / 180);
     ctx.scale(clip.flipH ? -1 : 1, clip.flipV ? -1 : 1);
@@ -454,12 +448,34 @@ export function attachStageInteractions(preview) {
     if (!sel || sel.track.locked) return;
     const { item, track } = sel;
     const start = JSON.parse(JSON.stringify(item));
-    // 이동 마스크는 재생 위치가 뒤쪽 절반이면 끝 위치를 편집한다
-    const editEnd = track.type === 'effect' && item.animate && preview.time - item.start > item.duration / 2;
+    const local = preview.time - item.start;
+    const from = track.type === 'effect' ? maskPositionAt(item, preview.time) : null;
     overlay.setPointerCapture(e.pointerId);
     let moved = false;
 
+    const moveMask = (dx, dy, shift) => {
+      const nx = Math.round(from.x + dx);
+      const ny = Math.round(from.y + dy);
+      item.keyframes = (start.keyframes ?? []).map((k) => ({ ...k }));
+      if (shift) {
+        // Shift: 위치 기록 전체를 함께 옮긴다
+        item.keyframes.forEach((k) => { k.x = Math.round(k.x + dx); k.y = Math.round(k.y + dy); });
+        item.x = Math.round(start.x + dx);
+        item.y = Math.round(start.y + dy);
+      } else if (!item.keyframes.length && local < 1 / store.project.settings.fps) {
+        // 시작 지점에서 끌면 처음 자리를 잡는 것이다
+        item.x = nx;
+        item.y = ny;
+      } else {
+        item.x = start.x;
+        item.y = start.y;
+        setMaskKeyframe(item, local, nx, ny);
+      }
+    };
+
     const move = (ev) => {
+      // 클릭할 때의 작은 흔들림으로 위치가 기록되지 않게 한다
+      if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < DRAG_THRESHOLD_PX) return;
       const q = toProject(ev);
       const dx = q.x - p.x;
       const dy = q.y - p.y;
@@ -470,13 +486,11 @@ export function attachStageInteractions(preview) {
         } else if (track.type === 'video') {
           item.posX = Math.round(start.posX + dx);
           item.posY = Math.round(start.posY + dy);
-        } else if (editEnd) {
-          item.x2 = Math.round(start.x2 + dx);
-          item.y2 = Math.round(start.y2 + dy);
+        } else if (track.type === 'effect') {
+          moveMask(dx, dy, ev.shiftKey);
         } else {
           item.x = Math.round(start.x + dx);
           item.y = Math.round(start.y + dy);
-          if (track.type === 'effect' && !item.animate) { item.x2 = item.x; item.y2 = item.y; }
         }
       }, { coalesce: `stage-${item.id}`, light: true });
     };

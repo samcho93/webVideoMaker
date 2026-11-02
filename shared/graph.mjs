@@ -3,7 +3,9 @@
 // 텍스트·아이콘·자막은 렌더러에서 PNG 로 래스터화해 넘겨받는다. 덕분에 미리보기와 결과물의
 // 글꼴·외곽선이 일치하고, ffmpeg 빌드의 폰트 지원 여부에 영향을 받지 않는다.
 
-import { computeClipLayout, normAngle } from './layout.mjs';
+import {
+  colorCurveExpr, colorMatrix, computeClipLayout, hasColorCurve, hasColorMatrix, normAngle, sharpenKernel, sharpnessOf,
+} from './layout.mjs';
 import { findMedia, itemDuration, itemEnd, projectDuration } from './model.mjs';
 
 const num = (v) => {
@@ -49,9 +51,36 @@ function rotationFilters(angle, w, h) {
 }
 
 function colorFilter(clip) {
-  const { brightness: b = 0, contrast: c = 0, saturation: s = 0 } = clip;
-  if (!b && !c && !s) return [];
-  return [`eq=brightness=${num(b * 0.5)}:contrast=${num(1 + c)}:saturation=${num(1 + s)}`];
+  const out = [];
+  if (hasColorCurve(clip) || hasColorMatrix(clip)) out.push('format=rgba');
+  if (hasColorCurve(clip)) out.push(`lutrgb=r='${colorCurveExpr(clip, 'r')}':g='${colorCurveExpr(clip, 'g')}':b='${colorCurveExpr(clip, 'b')}'`);
+  if (hasColorMatrix(clip)) {
+    const [rr, rg, rb, gr, gg, gb, br, bg, bb] = colorMatrix(clip).map(num);
+    out.push(`colorchannelmixer=rr=${rr}:rg=${rg}:rb=${rb}:gr=${gr}:gg=${gg}:gb=${gb}:br=${br}:bg=${bg}:bb=${bb}`);
+  }
+  const amount = sharpnessOf(clip);
+  if (amount) {
+    const kernel = sharpenKernel(amount).map(num).join(' ');
+    out.push('format=gbrap', `convolution=0m='${kernel}':1m='${kernel}':2m='${kernel}':3m='0 0 0 0 1 0 0 0 0'`);
+  }
+  return out;
+}
+
+/** 위치 기록을 따라 움직이는 좌표의 시간식. 미리보기의 maskPositionAt 과 같은 계산이다 */
+function maskAxisExpr(mask, axis) {
+  const keys = mask.keyframes;
+  if (!keys?.length) return num(mask[axis]);
+  const at = (k) => mask.start + k.t;
+  let expr = num(keys[keys.length - 1][axis]);
+  for (let i = keys.length - 2; i >= 0; i -= 1) {
+    const a = keys[i];
+    const b = keys[i + 1];
+    const segment = mask.motion === 'hold'
+      ? num(a[axis])
+      : `${num(a[axis])}+(${num(b[axis] - a[axis])})*(t-${num(at(a))})/${num(b.t - a.t)}`;
+    expr = `if(lt(t,${num(at(b))}),${segment},${expr})`;
+  }
+  return `if(lt(t,${num(at(keys[0]))}),${num(keys[0][axis])},${expr})`;
 }
 
 function fadeFilters(duration, fadeIn, fadeOut) {
@@ -148,8 +177,8 @@ export function buildExportPlan(project, assets = {}, opts = {}) {
     if (l || t || r || b) fg.push(`crop=iw*${num(1 - l - r)}:ih*${num(1 - t - b)}:iw*${num(l)}:ih*${num(t)}`);
     if (clip.flipH) fg.push('hflip');
     if (clip.flipV) fg.push('vflip');
-    fg.push(...colorFilter(clip));
     fg.push(`scale=${dw}:${dh}`);
+    fg.push(...colorFilter(clip));
     const rot = rotationFilters(L.angle, dw, dh);
     fg.push(...rot.filters);
     fg.push('format=yuva420p');
@@ -202,9 +231,8 @@ export function buildExportPlan(project, assets = {}, opts = {}) {
       const h = Math.min(even(mask.h), H);
       const clampX = (expr) => `min(max(${expr},0),${W - w})`;
       const clampY = (expr) => `min(max(${expr},0),${H - h})`;
-      const k = `min(max((t-${num(mask.start)})/${num(Math.max(mask.duration, 1e-3))},0),1)`;
-      const xExpr = mask.animate ? clampX(`${num(mask.x)}+(${num(mask.x2 - mask.x)})*${k}`) : clampX(num(mask.x));
-      const yExpr = mask.animate ? clampY(`${num(mask.y)}+(${num(mask.y2 - mask.y)})*${k}`) : clampY(num(mask.y));
+      const xExpr = clampX(maskAxisExpr(mask, 'x'));
+      const yExpr = clampY(maskAxisExpr(mask, 'y'));
       const between = `between(t,${num(mask.start)},${num(end)})`;
 
       const keep = nextLabel('m');

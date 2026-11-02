@@ -4,6 +4,7 @@ import {
   createCaption, createMediaClip, createProject, findMedia, isMediaClip, itemDuration, itemEnd,
   MIN_ITEM_DURATION, newId, normalizeProject, SPEED_MAX, SPEED_MIN, trackEnd,
 } from '/shared/model.mjs';
+import { splitMaskKeyframes } from '/shared/layout.mjs';
 import { parseNarration, parseSrt, serializeNarration, serializeSrt } from '/shared/narration.mjs';
 import { mediaUrl, store } from './store.js';
 import { toast } from './ui.js';
@@ -277,14 +278,8 @@ function splitItem(track, item, t) {
     tail.duration -= item.duration;
     if (tail.voiceClipId) tail.voiceClipId = null;
     if ('fadeOut' in item) { item.fadeOut = 0; tail.fadeIn = 0; }
-    if (item.animate) {
-      // 이동 경로는 나눈 지점의 위치에서 이어지게 한다
-      const k = item.duration / (item.duration + tail.duration);
-      const midX = item.x + (item.x2 - item.x) * k;
-      const midY = item.y + (item.y2 - item.y) * k;
-      item.x2 = midX; item.y2 = midY;
-      tail.x = midX; tail.y = midY;
-    }
+    // 위치 기록은 나눈 지점의 위치에서 이어지게 한다
+    splitMaskKeyframes(item, tail, item.duration);
   }
   track.clips.push(tail);
   return tail;

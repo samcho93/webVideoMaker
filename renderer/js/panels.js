@@ -288,7 +288,7 @@ function renderEffects() {
     heading('모자이크·블러'),
     buttonRow(['모자이크 (사각)', add('mosaic', 'rect')], ['모자이크 (타원)', add('mosaic', 'ellipse')]),
     buttonRow(['블러 (사각)', add('blur', 'rect')], ['블러 (타원)', add('blur', 'ellipse')]),
-    el('p', { class: 'hint', text: '재생 위치부터 5초 동안 적용됩니다. 미리보기 화면에서 영역을 끌어 옮기고 모서리로 크기를 조절하세요. 움직이는 대상은 오른쪽 패널의 "이동 경로"를 켜면 따라갑니다.' }),
+    el('p', { class: 'hint', text: '재생 위치부터 5초 동안 적용됩니다. 미리보기 화면에서 영역을 끌어 옮기고 모서리로 크기를 조절하세요. 대상이 움직이면 그 시각으로 이동한 뒤 영역을 끌어 옮기세요. 위치가 기록됩니다.' }),
     heading('빠른 페이드'),
     buttonRow(
       ['페이드 인 1초', () => quickFade('fadeIn')],

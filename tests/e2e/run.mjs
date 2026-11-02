@@ -607,13 +607,13 @@ await step('모자이크·블러 추가 (이동 경로 포함)', async () => {
   await evalApp(() => {
     const { store } = window.__wvm;
     const m = store.selected().item;
-    store.mutate(() => Object.assign(m, { start: 0, duration: 3, x: 100, y: 100, w: 500, h: 400, x2: 100, y2: 100, strength: 40 }));
+    store.mutate(() => Object.assign(m, { start: 0, duration: 3, x: 100, y: 100, w: 500, h: 400, strength: 40 }));
   });
   await page.locator('.btn-row button', { hasText: '블러 (타원)' }).click();
   await evalApp(() => {
     const { store } = window.__wvm;
     const m = store.selected().item;
-    store.mutate(() => Object.assign(m, { start: 3, duration: 3, x: 1100, y: 100, w: 500, h: 400, animate: true, x2: 1300, y2: 500, strength: 25 }));
+    store.mutate(() => Object.assign(m, { start: 3, duration: 3, x: 1100, y: 100, w: 500, h: 400, keyframes: [{ t: 0, x: 1100, y: 100 }, { t: 3, x: 1300, y: 500 }], strength: 25 }));
   });
   const masks = track(await projectState(), '모자이크·블러').clips;
   assert.equal(masks.length, 2);
@@ -621,6 +621,190 @@ await step('모자이크·블러 추가 (이동 경로 포함)', async () => {
   await shot('04-mosaic-text');
   await seek(4.5);
   await shot('05-blur');
+});
+
+await step('영상 조절: 패널 조작이 미리보기에 계산식대로 반영되고, 영상 패널 맨 위에 있다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'color=c=0x6080a0:s=1920x1080', '-frames:v', '1', '-update', '1', f('solid.png')]);
+  const undoBase = await evalApp(() => window.__wvm.store.past.length);
+  const clipId = await evalApp(async (file) => {
+    const { store, actions, preview } = window.__wvm;
+    const [media] = await actions.importPaths([file]);
+    const track = store.project.tracks.find((t) => t.name === 'V2');
+    const start = preview.duration + 1;
+    const clip = actions.placeOnTrack(media.id, track.id, start);
+    return clip.id;
+  }, f('solid.png'));
+  const start = await evalApp((id) => window.__wvm.store.selected().item.start, clipId);
+  await seek(start + 1);
+  const center = () => evalApp(() => {
+    const c = document.getElementById('preview');
+    return [...c.getContext('2d').getImageData(c.width / 2, c.height / 2, 1, 1).data].slice(0, 3);
+  });
+  await page.waitForFunction(() => {
+    const c = document.getElementById('preview');
+    return c.getContext('2d').getImageData(c.width / 2, c.height / 2, 1, 1).data[2] > 100;
+  }, null, { timeout: 15000 });
+  const headings = await page.locator('#properties h3, #properties .heading').allTextContents();
+  assert.equal(headings[0], '영상 조절', `첫 제목 ${headings[0]}`);
+  const setField = async (label, value) => {
+    const field = page.locator('#properties .field', { has: page.locator(`label:text-is("${label}")`) });
+    await field.locator('input[type=number]').fill(String(value));
+  };
+  const { colorCurveValue, colorMatrix } = await import('../../shared/layout.mjs');
+  const expectPixel = async (patch) => {
+    const curved = ['r', 'g', 'b'].map((ch, i) => colorCurveValue(patch, ch, [0x60, 0x80, 0xa0][i] / 255));
+    const m = colorMatrix(patch);
+    const expected = [0, 1, 2].map((r) => Math.max(0, Math.min(1, m[r * 3] * curved[0] + m[r * 3 + 1] * curved[1] + m[r * 3 + 2] * curved[2])) * 255);
+    await waitFrame();
+    const actual = await center();
+    actual.forEach((v, i) => assert.ok(Math.abs(v - expected[i]) <= 3, `${JSON.stringify(patch)} 기대 ${expected.map(Math.round)} 실제 ${actual}`));
+  };
+  const patch = {};
+  for (const [label, key, value] of [['밝기', 'brightness', 0.2], ['대비', 'contrast', 0.3], ['채도', 'saturation', 0.5], ['감마', 'gamma', 1.3], ['색온도', 'temperature', 0.4], ['색조', 'hue', 30]]) {
+    await setField(label, value);
+    patch[key] = value;
+    await expectPixel(patch);
+  }
+  await setField('선명도', 0.5);
+  await shot('color-adjust');
+  // 모든 항목을 켠 1080p 그리기 비용
+  const ms = await evalApp(() => {
+    const { preview } = window.__wvm;
+    const t0 = performance.now();
+    for (let i = 0; i < 10; i += 1) preview.draw();
+    preview.ctx.getImageData(0, 0, 1, 1);
+    return (performance.now() - t0) / 10;
+  });
+  console.log(`   1080p 전체 조절 그리기 ${ms.toFixed(1)}ms/프레임`);
+  // 재생 중에는 선명도를 빼서 끊기지 않는다
+  const playing = await evalApp(async () => {
+    const { store, preview } = window.__wvm;
+    const { clipFilter } = await import('/js/colorFilter.js');
+    const { item } = store.selected();
+    const filterHas = (value) => !!document.querySelector(value.replace('url(', '').replace(')', ''))?.querySelector('feConvolveMatrix');
+    const paused = filterHas(clipFilter(item));
+    const during = clipFilter(item, { sharpen: false });
+    preview.playing = true;
+    const t0 = performance.now();
+    for (let i = 0; i < 10; i += 1) preview.draw();
+    preview.ctx.getImageData(0, 0, 1, 1);
+    preview.playing = false;
+    return { paused, during: filterHas(during), ms: (performance.now() - t0) / 10 };
+  });
+  assert.equal(playing.paused, true);
+  assert.equal(playing.during, false);
+  console.log(`   재생 중 그리기 ${playing.ms.toFixed(1)}ms/프레임`);
+  assert.ok(playing.ms < ms / 3, `재생 중 ${playing.ms} / 멈춤 ${ms}`);
+  await page.locator('#properties button', { hasText: '조절 초기화' }).click();
+  await waitFrame();
+  const reset = await center();
+  reset.forEach((v, i) => assert.ok(Math.abs(v - [0x60, 0x80, 0xa0][i]) <= 2, `초기화 ${reset}`));
+  await evalApp((n) => {
+    const { store, actions } = window.__wvm;
+    while (store.past.length > n) store.undo();
+    const m = store.project.media.find((x) => x.name === 'solid.png');
+    if (m) actions.removeMedia(m.id);
+    store.select(null);
+  }, undoBase);
+});
+
+await step('모자이크: 영상 중간에 끌면 위치가 기록되고 그 시각부터 반영된다', async () => {
+  const stageBox = async () => page.locator('#stageOverlay').boundingBox();
+  const W = 1920;
+  const toScreen = async (x, y) => {
+    const b = await stageBox();
+    return [b.x + (x / W) * b.width, b.y + (y / W) * b.width];
+  };
+  const dragMask = async (fromX, fromY, toX, toY, modifiers = false) => {
+    const [ax, ay] = await toScreen(fromX, fromY);
+    const [bx, by] = await toScreen(toX, toY);
+    if (modifiers) await page.keyboard.down('Shift');
+    await page.mouse.move(ax, ay);
+    await page.mouse.down();
+    await page.mouse.move(bx, by, { steps: 4 });
+    await page.mouse.up();
+    if (modifiers) await page.keyboard.up('Shift');
+    await waitFrame();
+  };
+  const maskId = await evalApp(async () => {
+    const { store, actions, preview } = window.__wvm;
+    const { createMask } = await import('/shared/model.mjs');
+    const m = { ...createMask(1, 1920, 1080, 'mosaic'), x: 200, y: 200, w: 300, h: 300, duration: 8 };
+    actions.addItem('effect', m);
+    preview.seek(1);
+    return m.id;
+  });
+  const undoBase = await evalApp(() => window.__wvm.store.past.length);
+  const mask = () => evalApp((id) => JSON.parse(JSON.stringify(window.__wvm.store.project.tracks.flatMap((t) => t.clips).find((c) => c.id === id))), maskId);
+  const box = () => evalApp(() => {
+    const n = document.querySelector('.sel-box');
+    return n ? { left: parseFloat(n.style.left) * 19.2, top: parseFloat(n.style.top) * 10.8 } : null;
+  });
+  await seek(1);
+  // 시작 지점에서 끌면 자리만 옮긴다
+  await dragMask(350, 350, 450, 350);
+  let m = await mask();
+  assert.equal(m.keyframes.length, 0);
+  assert.equal(m.x, 300);
+  // 중간(4초)으로 가서 끌면 기록된다
+  await seek(4);
+  await dragMask(450, 350, 1200, 650);
+  m = await mask();
+  assert.equal(m.keyframes.length, 2, JSON.stringify(m.keyframes));
+  assert.deepEqual(m.keyframes[0], { t: 0, x: 300, y: 200 });
+  assert.ok(Math.abs(m.keyframes[1].t - 3) < 0.05);
+  assert.ok(Math.abs(m.keyframes[1].x - 1050) <= 3 && Math.abs(m.keyframes[1].y - 500) <= 3, JSON.stringify(m.keyframes[1]));
+  assert.ok(await page.locator('#properties .kf-row').count() === 2, '패널 목록');
+  assert.ok(await page.locator('.clip .kf').count() >= 2, '타임라인 표시');
+  // 시각별 위치
+  await seek(1);
+  let b = await box();
+  assert.ok(Math.abs(b.left - 300) < 4 && Math.abs(b.top - 200) < 4, `시작 ${JSON.stringify(b)}`);
+  await seek(2.5);
+  b = await box();
+  assert.ok(Math.abs(b.left - 675) < 8, `중간 ${JSON.stringify(b)}`);
+  await seek(7);
+  b = await box();
+  assert.ok(Math.abs(b.left - 1050) < 4 && Math.abs(b.top - 500) < 4, `기록 뒤 ${JSON.stringify(b)}`);
+  await shot('mask-keyframe');
+  // 바로 이동 방식
+  await page.locator('#properties .field', { hasText: '이동 방식' }).locator('select').selectOption('hold');
+  await seek(3.9);
+  b = await box();
+  assert.ok(Math.abs(b.left - 300) < 4, `바로 이동 전 ${JSON.stringify(b)}`);
+  await seek(4);
+  b = await box();
+  assert.ok(Math.abs(b.left - 1050) < 4, `바로 이동 후 ${JSON.stringify(b)}`);
+  await page.locator('#properties .field', { hasText: '이동 방식' }).locator('select').selectOption('linear');
+  // Shift 끌기는 전체를 옮긴다
+  await seek(7);
+  await dragMask(1200, 650, 1100, 650, true);
+  m = await mask();
+  assert.equal(m.keyframes.length, 2);
+  assert.ok(Math.abs(m.keyframes[0].x - 200) <= 3 && Math.abs(m.keyframes[1].x - 950) <= 3, JSON.stringify(m.keyframes));
+  // 자르면 나눈 지점에서 이어진다
+  await seek(2.5);
+  const before = await box();
+  await page.locator('#tlSplit').click();
+  await waitFrame();
+  const split = await evalApp((id) => {
+    const { store } = window.__wvm;
+    return store.project.tracks.flatMap((t) => t.clips).filter((c) => c.effect && c.id !== id && c.start > 2).map((c) => JSON.parse(JSON.stringify(c)));
+  }, maskId);
+  const tail = split.find((c) => Math.abs(c.start - 2.5) < 0.01);
+  assert.ok(tail, '뒷조각');
+  assert.ok(Math.abs(tail.keyframes[0].x - before.left) < 8, `이어지는 위치 ${tail.keyframes[0].x} / ${before.left}`);
+  // 기록 삭제
+  await evalApp((id) => window.__wvm.store.select(id), maskId);
+  await seek(2);
+  await page.locator('#properties button', { hasText: '위치 기록 모두 지우기' }).click();
+  m = await mask();
+  assert.equal(m.keyframes.length, 0);
+  await evalApp((n) => {
+    const { store } = window.__wvm;
+    while (store.past.length > n) store.undo();
+  }, undoBase - 1);
+  await evalApp(() => window.__wvm.store.select(null));
 });
 
 await step('나레이션 파일 파싱 후 자막·SRT 처리', async () => {

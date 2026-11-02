@@ -65,11 +65,11 @@ test('음소거 트랙과 숨긴 트랙은 제외된다', () => {
 test('이동 모자이크는 시간식을 쓴다', () => {
   const p = setup();
   track(p, 'V1').clips.push(createMediaClip(video, 0));
-  const mask = { ...createMask(1, 1920, 1080, 'mosaic'), animate: true, x: 0, y: 0, x2: 400, y2: 0 };
+  const mask = { ...createMask(1, 1920, 1080, 'mosaic'), x: 0, y: 0, keyframes: [{ t: 0, x: 0, y: 0 }, { t: 5, x: 400, y: 0 }] };
   track(p, '모자이크·블러').clips.push(mask);
   const { filter } = buildExportPlan(p);
   assert.match(filter, /flags=neighbor/);
-  assert.match(filter, /\(400\)\*min\(max\(\(t-1\)\/5,0\),1\)/);
+  assert.match(filter, /if\(lt\(t,6\),0\+\(400\)\*\(t-1\)\/5,400\)/);
   assert.match(filter, /between\(t,1,6\)/);
 });
 

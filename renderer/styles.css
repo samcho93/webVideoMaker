@@ -187,6 +187,12 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .clip .thumbs { position: absolute; inset: 0; display: flex; overflow: hidden; pointer-events: none; opacity: .75; }
 .clip .thumbs i { flex: none; height: 100%; background-repeat: no-repeat; }
 .clip canvas.wave { position: absolute; left: 0; bottom: 0; width: 100%; height: 100%; pointer-events: none; }
+.clip .kf { position: absolute; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; background: #ffd24a; border: 1px solid #000; transform: rotate(45deg); pointer-events: none; z-index: 3; }
+.kf-row { display: grid; grid-template-columns: minmax(0, 1fr) 58px 58px 24px; gap: 3px; align-items: center; margin-bottom: 3px; }
+.kf-row button { padding: 1px 3px; }
+.kf-row input { min-width: 0; width: 100%; }
+.kf-row .kf-time { font-family: Consolas, monospace; font-size: 11px; text-align: left; white-space: nowrap; }
+.kf-row.current .kf-time { color: #ffd24a; border-color: #ffd24a; }
 .clip .fade { position: absolute; top: 0; bottom: 0; pointer-events: none; z-index: 1; }
 .clip .fade.in { left: 0; background: linear-gradient(to bottom right, #000c 50%, #0000 50%); }
 .clip .fade.out { right: 0; background: linear-gradient(to bottom left, #000c 50%, #0000 50%); }

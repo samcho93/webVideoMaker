@@ -1,8 +1,9 @@
 // 오른쪽 패널: 선택 항목의 속성. 입력 중에는 패널을 다시 만들지 않아 포커스가 유지된다.
 
 import { findMedia, itemDuration, projectDuration, SPEED_MAX, SPEED_MIN } from '/shared/model.mjs';
+import { COLOR_DEFAULTS, maskPositionAt, setMaskKeyframe } from '/shared/layout.mjs';
 import { formatPrecise } from '/shared/time.mjs';
-import { setClipSpeed } from './actions.js';
+import { playhead, seekTo, setClipSpeed } from './actions.js';
 import { store } from './store.js';
 import {
   buttonRow, checkField, colorField, el, FONTS, heading, numberField, rangeField, selectField, textArea, timeField, toast,
@@ -103,28 +104,102 @@ function renderMask(item) {
     selectField('모양', [['rect', '사각형'], ['ellipse', '타원']], () => item.shape, setter(item, 'shape')),
     rangeField(item.effect === 'mosaic' ? '블록 크기' : '흐림 정도', () => item.strength, setter(item, 'strength'), { min: 2, max: item.effect === 'mosaic' ? 120 : 80, step: 1 }),
     heading('영역'),
-    numberField('왼쪽', () => item.x, setter(item, 'x')),
-    numberField('위', () => item.y, setter(item, 'y')),
+    ...(item.keyframes?.length ? [] : [
+      numberField('왼쪽', () => item.x, setter(item, 'x')),
+      numberField('위', () => item.y, setter(item, 'y')),
+    ]),
     numberField('너비', () => item.w, setter(item, 'w'), { min: 4 }),
     numberField('높이', () => item.h, setter(item, 'h'), { min: 4 }),
-    heading('이동 경로'),
-    checkField('움직이기', () => item.animate, (v) => {
-      store.mutate(() => {
-        item.animate = v;
-        if (v) { item.x2 = item.x; item.y2 = item.y; }
-      });
-      renderProperties();
-    }),
+    ...maskKeyframeFields(item),
+    ...timing(item, { fades: false }),
   ];
-  if (item.animate) {
-    parts.push(
-      numberField('끝 위치 왼쪽', () => item.x2, setter(item, 'x2')),
-      numberField('끝 위치 위', () => item.y2, setter(item, 'y2')),
-      el('p', { class: 'hint', text: '재생 위치를 구간 앞쪽에 두고 끌면 시작 위치가, 뒤쪽에 두고 끌면 끝 위치가 바뀝니다.' }),
-    );
-  }
-  parts.push(...timing(item, { fades: false }));
   box().replaceChildren(...parts);
+}
+
+function maskKeyframeFields(item) {
+  const keys = item.keyframes ?? [];
+  const parts = [
+    heading('위치 변경'),
+    el('p', { class: 'hint', text: '대상이 움직이면 그 시각으로 이동한 뒤 화면에서 영역을 끌어 옮기세요. 위치가 기록되고 내보내기에도 반영됩니다. Shift 를 누르고 끌면 기록 전체를 함께 옮깁니다.' }),
+    selectField('이동 방식', [['linear', '부드럽게 따라가기'], ['hold', '그 시각에 바로 이동']], () => item.motion ?? 'linear', setter(item, 'motion')),
+  ];
+  const now = playhead() - item.start;
+  keys.forEach((key, i) => {
+    const axis = (name) => {
+      const input = el('input', { type: 'number', step: 1, value: Math.round(key[name]), title: name === 'x' ? '왼쪽' : '위' });
+      input.addEventListener('input', () => {
+        if (input.value === '' || Number.isNaN(+input.value)) return;
+        store.mutate(() => {
+          key[name] = +input.value;
+          if (i === 0) item[name] = +input.value;
+        }, { coalesce: `${item.id}-kf-${i}-${name}` });
+      });
+      return input;
+    };
+    parts.push(el('div', { class: `kf-row${Math.abs(now - key.t) < 0.02 ? ' current' : ''}` },
+      el('button', { class: 'kf-time', text: formatPrecise(item.start + key.t), title: '이 시각으로 이동', onclick: () => { seekTo(item.start + key.t); renderProperties(); } }),
+      axis('x'),
+      axis('y'),
+      el('button', {
+        class: 'danger',
+        text: '✕',
+        title: '이 위치 기록 삭제',
+        onclick: () => {
+          store.mutate(() => {
+            keys.splice(i, 1);
+            if (keys.length && i === 0) { item.x = keys[0].x; item.y = keys[0].y; }
+            if (keys.length === 1) { item.x = keys[0].x; item.y = keys[0].y; item.keyframes = []; }
+          });
+          renderProperties();
+        },
+      })));
+  });
+  parts.push(buttonRow(
+    ['현재 시각에 위치 기록', () => {
+      const t = playhead();
+      if (t < item.start || t >= item.start + item.duration) { toast('재생 위치를 이 효과의 구간 안으로 옮기세요.', { error: true }); return; }
+      const at = maskPositionAt(item, t);
+      store.mutate(() => setMaskKeyframe(item, t - item.start, Math.round(at.x), Math.round(at.y)));
+      renderProperties();
+    }],
+    ...(keys.length ? [['위치 기록 모두 지우기', () => {
+      const at = maskPositionAt(item, playhead());
+      store.mutate(() => { item.keyframes = []; item.x = Math.round(at.x); item.y = Math.round(at.y); });
+      renderProperties();
+    }]] : []),
+  ));
+  return parts;
+}
+
+const COLOR_KEYS = Object.keys(COLOR_DEFAULTS);
+
+function colorFields(item) {
+  return [
+    heading('영상 조절'),
+    rangeField('밝기', () => item.brightness ?? 0, setter(item, 'brightness'), { min: -1, max: 1, step: 0.01 }),
+    rangeField('대비', () => item.contrast ?? 0, setter(item, 'contrast'), { min: -0.9, max: 1, step: 0.01 }),
+    rangeField('채도', () => item.saturation ?? 0, setter(item, 'saturation'), { min: -1, max: 2, step: 0.01 }),
+    rangeField('감마', () => item.gamma ?? 1, setter(item, 'gamma'), { min: 0.2, max: 3, step: 0.01 }),
+    rangeField('색온도', () => item.temperature ?? 0, setter(item, 'temperature'), { min: -1, max: 1, step: 0.01 }),
+    rangeField('색조', () => item.hue ?? 0, setter(item, 'hue'), { min: -180, max: 180, step: 1 }),
+    rangeField('선명도', () => item.sharpness ?? 0, setter(item, 'sharpness'), { min: 0, max: 1, step: 0.01 }),
+    el('p', { class: 'hint', text: '선명도는 재생을 멈춘 화면과 내보낸 영상에 적용됩니다. 재생 중 미리보기에서는 끊김을 막기 위해 생략합니다.' }),
+    buttonRow(
+      ['조절 초기화', () => {
+        store.mutate(() => Object.assign(item, COLOR_DEFAULTS));
+        renderProperties();
+      }],
+      ['모든 영상에 적용', () => {
+        store.mutate((p) => {
+          for (const track of p.tracks) {
+            if (track.type !== 'video') continue;
+            for (const clip of track.clips) for (const key of COLOR_KEYS) clip[key] = item[key] ?? COLOR_DEFAULTS[key];
+          }
+        });
+        toast('이 조절 값을 모든 영상·사진 클립에 적용했습니다.');
+      }, '비디오 트랙의 모든 클립에 같은 값을 적용합니다'],
+    ),
+  ];
 }
 
 function renderCaption(track, item) {
@@ -155,6 +230,7 @@ function renderClip(track, item, media) {
   title(media.name);
   const parts = [
     el('p', { class: 'hint', text: `원본 ${media.width ? `${media.width}×${media.height}` : '오디오'}${media.duration ? ` · ${formatPrecise(media.duration)}` : ''}` }),
+    ...(media.type !== 'audio' ? colorFields(item) : []),
     heading('시간'),
     timeField('시작', () => item.start, setter(item, 'start')),
   ];
@@ -211,10 +287,6 @@ function renderClip(track, item, media) {
       cropField('오른쪽', 'r'),
       cropField('위', 't'),
       cropField('아래', 'b'),
-      heading('색 보정'),
-      rangeField('밝기', () => item.brightness, setter(item, 'brightness'), { min: -1, max: 1, step: 0.01 }),
-      rangeField('대비', () => item.contrast, setter(item, 'contrast'), { min: -0.9, max: 1, step: 0.01 }),
-      rangeField('채도', () => item.saturation, setter(item, 'saturation'), { min: -1, max: 2, step: 0.01 }),
     );
   }
   box().replaceChildren(...parts);

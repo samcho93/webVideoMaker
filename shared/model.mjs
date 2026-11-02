@@ -111,6 +111,10 @@ export function createMediaClip(media, start = 0) {
     brightness: 0,
     contrast: 0,
     saturation: 0,
+    gamma: 1,
+    temperature: 0,
+    hue: 0,
+    sharpness: 0,
   };
 }
 
@@ -187,10 +191,17 @@ export function createMask(start, W, H, effect = 'mosaic', shape = 'rect') {
     w,
     h,
     strength: effect === 'mosaic' ? 24 : 20,
-    animate: false,
-    x2: x,
-    y2: y,
+    // 위치 기록: t 는 마스크 시작 기준 초. 비어 있으면 x, y 에 고정된다
+    keyframes: [],
+    motion: 'linear', // linear: 사이를 부드럽게 이동, hold: 다음 기록까지 그대로 있다가 바로 이동
   };
+}
+
+/** 1.0.x 의 시작·끝 두 점 이동을 위치 기록으로 옮긴다 */
+function migrateMask(mask) {
+  const { animate, x2, y2, ...rest } = mask;
+  const keyframes = rest.keyframes ?? (animate ? [{ t: 0, x: rest.x, y: rest.y }, { t: rest.duration, x: x2, y: y2 }] : []);
+  return { motion: 'linear', ...rest, keyframes };
 }
 
 /** 저장본을 불러올 때 누락 필드를 채운다 */
@@ -199,5 +210,8 @@ export function normalizeProject(raw) {
   const project = { ...base, ...raw, settings: { ...base.settings, ...raw.settings } };
   project.media = raw.media || [];
   project.tracks = (raw.tracks || base.tracks).map((t) => ({ muted: false, hidden: false, locked: false, clips: [], ...t }));
+  for (const track of project.tracks) {
+    if (track.type === 'effect') track.clips = track.clips.map(migrateMask);
+  }
   return project;
 }
