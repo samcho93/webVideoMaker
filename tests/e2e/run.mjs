@@ -46,12 +46,21 @@ const app = await electron.launch({
   env: { ...process.env, WVM_E2E: '1' },
 });
 const page = await app.firstWindow();
+app.process().on('exit', (code) => console.log(`[앱 종료 code=${code}]`));
+page.on('crash', () => console.log('[렌더러 비정상 종료]'));
 const errors = [];
 page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
 await page.waitForFunction(() => window.__wvm);
-await page.setViewportSize({ width: 1600, height: 980 }).catch(() => {});
+// 화면 크기 에뮬레이션은 실제 끌기와 충돌하므로 창 크기를 직접 지정한다
+await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1600, 980));
+await page.waitForTimeout(200);
 
+// 이전 실행에서 저장된 타임라인 높이를 지운다
+await page.evaluate(() => {
+  localStorage.removeItem('wvm.timelineHeight');
+  document.documentElement.style.removeProperty('--tl-height');
+});
 const shot = (name) => page.screenshot({ path: f(`${name}.png`) });
 const evalApp = (fn, arg) => page.evaluate(fn, arg);
 const projectState = () => evalApp(() => JSON.parse(JSON.stringify(window.__wvm.store.project)));
@@ -81,9 +90,363 @@ await step('여러 형식의 미디어 가져오기 (세로·사진·음악·프
   assert.equal(p.media.find((m) => m.name === 'legacy.avi').needsProxy, true);
   await page.waitForFunction(() => {
     const { store } = window.__wvm;
-    return store.project.media.every((m) => (m.type === 'audio' || store.rt(m.id).sprite) && (!m.needsProxy || store.rt(m.id).proxy) && (!m.hasAudio || store.rt(m.id).peaks));
+    return store.project.media.every((m) => (m.type === 'audio' || store.rt(m.id).spriteCount > 0) && (!m.needsProxy || store.rt(m.id).proxy || store.rt(m.id).playable));
   }, null, { timeout: 60000 });
   assert.equal(await page.locator('.media-card').count(), 5);
+});
+
+const totalClips = () => evalApp(() => window.__wvm.store.project.tracks.reduce((n, t) => n + t.clips.length, 0));
+
+/** 실제 마우스로 미디어 카드를 끌어다 놓는다 */
+async function dragCard(name, x, y) {
+  await evalApp(() => {
+    window.__dragStarts = window.__dragStarts ?? 0;
+    if (!window.__dragCounter) {
+      window.__dragCounter = true;
+      window.addEventListener('dragstart', () => { window.__dragStarts += 1; }, true);
+    }
+  });
+  // 시뮬레이션에서 드물게 끌기가 시작되지 않을 때만 다시 시도한다 (앱이 받은 끌기를 다시 하는 것은 아니다)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const started = await evalApp(() => window.__dragStarts);
+    const c = await page.locator('.media-card', { hasText: name }).boundingBox();
+    await page.mouse.move(c.x + c.width / 2, c.y + 30);
+    await page.mouse.down();
+    await page.mouse.move(c.x + c.width / 2 + 20, c.y + 40, { steps: 3 });
+    await page.mouse.move(x, y, { steps: 6 });
+    await page.waitForTimeout(120);
+    await page.mouse.up();
+    await page.waitForTimeout(120);
+    if (await evalApp(() => window.__dragStarts) > started) return;
+  }
+  throw new Error(`끌기가 시작되지 않음: ${name}`);
+}
+
+/** 끄는 중의 dragover 를 그대로 보낸다. Playwright 의 끌기는 지나가는 dragover 를 일부만 전달한다 */
+const dragOverAt = (name, x, y) => evalApp(([n, cx, cy]) => {
+  const { store } = window.__wvm;
+  const media = store.project.media.find((m) => m.name === n);
+  const dataTransfer = new DataTransfer();
+  dataTransfer.setData(`application/x-wvm-${media.type === 'audio' ? 'audio' : 'video'}`, media.id);
+  store.draggingMedia = media.id;
+  const event = new DragEvent('dragover', { bubbles: true, cancelable: true, clientX: cx, clientY: cy, dataTransfer });
+  document.elementFromPoint(cx, cy).dispatchEvent(event);
+  return event.defaultPrevented;
+}, [name, x, y]);
+const endDragOver = () => evalApp(() => {
+  window.__wvm.store.draggingMedia = null;
+  window.dispatchEvent(new DragEvent('dragend'));
+});
+const rowCenter = async (name) => {
+  const id = await evalApp((n) => window.__wvm.store.project.tracks.find((t) => t.name === n).id, name);
+  for (let i = 0; i < 20; i += 1) {
+    const box = await page.evaluate((trackId) => {
+      const row = document.querySelector(`.tl-row[data-track-id="${trackId}"]`);
+      if (!row) return null;
+      row.scrollIntoView({ block: 'nearest' });
+      const r = row.getBoundingClientRect();
+      return { x: r.x, y: r.y, height: r.height };
+    }, id);
+    if (box) return { x: box.x + 200, y: box.y + box.height / 2 };
+    await page.waitForTimeout(50);
+  }
+  throw new Error(`트랙 줄을 찾지 못함: ${name}`);
+};
+const undoAll = async (count) => { for (let i = 0; i < count; i += 1) await evalApp(() => window.__wvm.store.undo()); };
+
+await step('+비디오·+오디오 버튼이 항상 보이고 트랙을 추가한다', async () => {
+  const before = (await projectState()).tracks.length;
+  for (const label of ['+비디오', '+오디오']) {
+    const box = await page.locator('#tlCorner button', { hasText: label }).boundingBox();
+    const hit = await evalApp(([x, y]) => document.elementFromPoint(x, y)?.textContent, [box.x + box.width / 2, box.y + box.height / 2]);
+    assert.equal(hit, label, `${label} 이 가려지지 않음`);
+    assert.ok(box.width >= 40, `${label} 너비 ${box.width}`);
+  }
+  await page.locator('#tlCorner button', { hasText: '+오디오' }).click();
+  await page.locator('#tlCorner button', { hasText: '+비디오' }).click();
+  assert.equal((await projectState()).tracks.length, before + 2);
+  await evalApp(() => { document.getElementById('tlScroll').scrollTop = 9999; });
+  const corner = await page.locator('#tlCorner').boundingBox();
+  const header = await page.locator('#tlHeaders').boundingBox();
+  assert.ok(Math.abs(corner.y - header.y) < 1, '스크롤해도 맨 위에 고정');
+  await shot('02-track-buttons');
+  await evalApp((n) => {
+    const { store } = window.__wvm;
+    store.project.tracks = store.project.tracks.filter((t) => t.clips.length || !/^[VA]\d+$/.test(t.name) || ['V1', 'V2'].includes(t.name));
+    store.emit('project');
+    return n;
+  }, before);
+  assert.equal((await projectState()).tracks.length, before);
+  await evalApp(() => { document.getElementById('tlScroll').scrollTop = 0; });
+});
+
+await step('끌어다 놓기: 다른 종류의 트랙과 빈 곳에 놓아도 가까운 맞는 트랙에 들어간다', async () => {
+  const cases = [
+    ['가로영상.mp4', '음악', 'V1'],
+    ['가로영상.mp4', '나레이션 음성', 'V1'],
+    ['가로영상.mp4', '자막', 'V2'],
+    ['photo.png', '모자이크·블러', 'V2'],
+    ['music.mp3', 'V1', '음악'],
+    ['music.mp3', '자막', '음악'],
+    ['가로영상.mp4', 'V1', 'V1'],
+  ];
+  for (const [card, over, expected] of cases) {
+    const { x, y } = await rowCenter(over);
+    assert.equal(await dragOverAt(card, x, y), true, `${card} → ${over}: 놓기 허용`);
+    const marked = await evalApp(() => {
+      const marker = document.querySelector('.tl-drop-marker');
+      const { store } = window.__wvm;
+      return marker ? store.project.tracks.find((t) => t.id === marker.parentElement.dataset.trackId).name : null;
+    });
+    assert.equal(marked, expected, `${card} → ${over}: 놓을 위치 표시`);
+    await endDragOver();
+    await dragCard(card, x, y);
+    const p = await projectState();
+    assert.equal(track(p, expected).clips.length, 1, `${card} → ${over}: ${expected} 에 배치`);
+    assert.equal(await page.locator('.tl-drop-marker').count(), 0);
+    await undoAll(1);
+  }
+  const area = await page.locator('#tlScroll').boundingBox();
+  await dragCard('가로영상.mp4', area.x + 200, area.y + area.height - 4);
+  assert.equal(track(await projectState(), 'V1').clips.length, 1, '맨 아래 빈 곳 → V1');
+  await undoAll(1);
+});
+
+await step('타임라인: 기본 크기에서 모든 트랙이 보이고, 높이를 조절하면 가려진 트랙으로 자동 스크롤한다', async () => {
+  const fits = () => evalApp(() => {
+    const s = document.getElementById('tlScroll');
+    return s.scrollHeight <= s.clientHeight + 1;
+  });
+  const sizes = await evalApp(() => {
+    const s = document.getElementById('tlScroll');
+    return `${s.scrollHeight}/${s.clientHeight}/${s.offsetHeight} w${s.scrollWidth}/${s.clientWidth} tb${document.getElementById('tlToolbar').offsetHeight} tl${document.getElementById('timeline').offsetHeight}`;
+  });
+  assert.equal(await fits(), true, `기본 높이에서 세로 스크롤 없음 ${sizes}`);
+  const handle = await page.locator('#tlResizer').boundingBox();
+  await page.mouse.move(handle.x + 500, handle.y + 4);
+  await page.mouse.down();
+  await page.mouse.move(handle.x + 500, handle.y + 170, { steps: 4 });
+  await page.mouse.up();
+  const height = await evalApp(() => document.getElementById('timeline').getBoundingClientRect().height);
+  assert.ok(height < 220, `줄어든 높이 ${height}`);
+  assert.equal(await fits(), false);
+  await evalApp(() => { document.getElementById('tlScroll').scrollTop = 0; });
+  // 아래 가장자리에 머무르면 가려진 트랙이 드러난다
+  const area = await page.locator('#tlScroll').boundingBox();
+  for (let i = 0; i < 20; i += 1) await dragOverAt('가로영상.mp4', area.x + 200, area.y + area.height - 6);
+  const scrolled = await evalApp(() => document.getElementById('tlScroll').scrollTop);
+  assert.ok(scrolled > 0, `자동 스크롤 ${scrolled}`);
+  await endDragOver();
+  await dragCard('가로영상.mp4', area.x + 200, area.y + area.height - 6);
+  const placed = await projectState();
+  assert.equal(track(placed, 'V1').clips.length + track(placed, 'V2').clips.length, 1);
+  await undoAll(1);
+  await evalApp(() => {
+    localStorage.removeItem('wvm.timelineHeight');
+    document.documentElement.style.removeProperty('--tl-height');
+    document.getElementById('tlScroll').scrollTop = 0;
+  });
+  assert.equal(await fits(), true, '기본 높이로 복원');
+});
+
+await step('끌어다 놓기: 잠긴 트랙은 건너뛰고, 모두 잠기면 이유를 알려 준다', async () => {
+  const setLock = (names, value) => evalApp(([n, v]) => {
+    const { store } = window.__wvm;
+    store.mutate((p) => { for (const t of p.tracks) if (n.includes(t.name)) t.locked = v; });
+  }, [names, value]);
+  await setLock(['V1'], true);
+  let target = await rowCenter('V1');
+  await dragCard('가로영상.mp4', target.x, target.y);
+  assert.equal(track(await projectState(), 'V2').clips.length, 1);
+  await undoAll(2);
+  await setLock(['V1', 'V2'], true);
+  target = await rowCenter('V1');
+  const before = await totalClips();
+  await dragCard('가로영상.mp4', target.x, target.y);
+  assert.equal(await totalClips(), before);
+  assert.ok(await page.locator('.toast.error', { hasText: '잠금' }).count() >= 1);
+  await undoAll(1);
+});
+
+await step('끌어다 놓기: 끄는 도중 타임라인 갱신이 와도 놓은 자리에 들어간다', async () => {
+  const { x, y } = await rowCenter('V1');
+  await dragOverAt('가로영상.mp4', x, y);
+  await evalApp(() => { window.__rowBefore = document.querySelector('.tl-row.drop'); window.__wvm.store.emit('media-timeline'); });
+  assert.equal(await evalApp(() => window.__rowBefore === document.querySelector('.tl-row.drop') && window.__rowBefore.isConnected), true, '끄는 동안 줄을 교체하지 않음');
+  await endDragOver();
+  assert.equal(await page.locator('.tl-drop-marker').count(), 0);
+  assert.equal(await evalApp(() => window.__rowBefore.isConnected), false, '끝나면 밀린 갱신을 그린다');
+});
+
+await step('끌어다 놓기: 변환 진행률이 갱신되는 중에도 끊기지 않는다', async () => {
+  await evalApp(() => {
+    const { store } = window.__wvm;
+    const { id } = store.project.media.find((m) => m.name === '가로영상.mp4');
+    let n = 0;
+    window.__spam = setInterval(() => {
+      n += 1;
+      store.setRuntime(id, { proxyProgress: (n % 100) / 100 }, { progressOnly: true });
+      if (n % 3 === 0) store.setRuntime(id, { sprite: store.rt(id).sprite });
+    }, 30);
+  });
+  try {
+    for (let i = 0; i < 5; i += 1) {
+      const before = await totalClips();
+      const { x, y } = await rowCenter('V1');
+      await dragCard('가로영상.mp4', x + i * 10, y);
+      assert.equal(await totalClips(), before + 1, `${i + 1}번째 끌기`);
+    }
+  } finally {
+    await evalApp(() => {
+      clearInterval(window.__spam);
+      const { store } = window.__wvm;
+      store.setRuntime(store.project.media.find((m) => m.name === '가로영상.mp4').id, { proxyProgress: null });
+    });
+  }
+  await undoAll(5);
+});
+
+await step('클립을 끄는 도중 썸네일이 도착해도 끌기가 이어진다', async () => {
+  const { x, y } = await rowCenter('V1');
+  await dragCard('가로영상.mp4', x, y);
+  const box = await page.locator('#tlRows .clip').first().boundingBox();
+  const before = (await projectState()).tracks.flatMap((t) => t.clips)[0].start;
+  await page.mouse.move(box.x + 30, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 60, box.y + box.height / 2, { steps: 3 });
+  await evalApp(() => {
+    const { store } = window.__wvm;
+    const { id } = store.project.media.find((m) => m.name === '가로영상.mp4');
+    store.setRuntime(id, { spriteCount: store.rt(id).spriteCount });
+  });
+  await page.waitForTimeout(150);
+  assert.ok(await page.locator('#tlRows .clip').first().evaluate((n) => n.isConnected));
+  await page.mouse.move(box.x + 130, box.y + box.height / 2, { steps: 3 });
+  await page.mouse.up();
+  const after = (await projectState()).tracks.flatMap((t) => t.clips)[0].start;
+  assert.ok(after > before, `이동됨 ${before} → ${after}`);
+  await undoAll(2);
+});
+
+await step('형식별 가져오기: 바로 재생되면 변환하지 않고, 안 되면 옮겨 담아 빠르게 준비한다', async () => {
+  await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c', 'copy', f('box.mkv')]);
+  await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c:v', 'copy', '-c:a', 'ac3', '-f', 'mpegts', f('camera.mts')]);
+  await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c:v', 'copy', '-c:a', 'pcm_s16le', f('camera.mov')]);
+  const names = ['box.mkv', 'camera.mts', 'camera.mov'];
+  await evalApp((p) => window.__wvm.actions.importPaths(p), names.map(f));
+  await page.waitForFunction((n) => {
+    const { store } = window.__wvm;
+    return n.every((name) => {
+      const m = store.project.media.find((x) => x.name === name);
+      return m && (store.rt(m.id).proxy || store.rt(m.id).playable);
+    });
+  }, names, { timeout: 60000 });
+  const state = await evalApp((n) => {
+    const { store } = window.__wvm;
+    return Object.fromEntries(n.map((name) => {
+      const m = store.project.media.find((x) => x.name === name);
+      const rt = store.rt(m.id);
+      return [name, { needsProxy: m.needsProxy, playable: rt.playable, proxy: rt.proxy || null, id: m.id }];
+    }));
+  }, names);
+  console.log('  ', JSON.stringify(Object.fromEntries(Object.entries(state).map(([k, v]) => [k, v.proxy ? path.basename(v.proxy).split('.').slice(1).join('.') : `playable=${v.playable}`]))));
+  assert.equal(state['box.mkv'].playable, true, 'H.264/AAC MKV 는 원본 재생');
+  assert.equal(state['box.mkv'].proxy, null);
+  assert.match(state['camera.mts'].proxy, /\.remux\.mp4$/, 'MTS 는 옮겨 담기');
+  // 옮겨 담은 파일이 원본과 같은 코덱·길이인지 확인한다
+  const remuxed = await probe(state['camera.mts'].proxy);
+  assert.equal(remuxed.videoCodec, 'h264');
+  assert.equal(remuxed.audioCodec, 'aac');
+  assert.ok(Math.abs(remuxed.duration - 8) < 0.2, `길이 ${remuxed.duration}`);
+  // 옮겨 담은 미리보기가 실제로 그려진다
+  await evalApp((id) => window.__wvm.actions.appendToTimeline(id), state['camera.mts'].id);
+  await seek(2);
+  const colors = await evalApp(() => {
+    const c = document.getElementById('preview');
+    const data = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    const seen = new Set();
+    for (let i = 0; i < data.length; i += 4000) seen.add((data[i] >> 4) << 8 | (data[i + 1] >> 4) << 4 | (data[i + 2] >> 4));
+    return seen.size;
+  });
+  assert.ok(colors > 8, `색 ${colors}`);
+  await undoAll(1);
+  for (const name of names) await evalApp((id) => window.__wvm.actions.removeMedia(id), state[name].id);
+});
+
+await step('재생 중 오류가 나면 미리보기 파일로 자동 전환한다', async () => {
+  const [m] = await evalApp((p) => window.__wvm.actions.importPaths([p]).then((r) => r.map((x) => ({ id: x.id }))), f('raw.mp4'));
+  await evalApp((id) => window.__wvm.actions.appendToTimeline(id), m.id);
+  await seek(1);
+  await evalApp(() => {
+    const [slot] = window.__wvm.preview.slots.values();
+    slot.el.dispatchEvent(new Event('error'));
+  });
+  await page.waitForFunction((id) => window.__wvm.store.rt(id).proxy, m.id, { timeout: 30000 });
+  await undoAll(1);
+  await evalApp((id) => window.__wvm.actions.removeMedia(id), m.id);
+});
+
+await step('읽지 못한 파일은 이유를 알려 주고, 나머지는 정상으로 들어온다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'smptebars=s=320x240:d=1', '-frames:v', '1', '-c:v', 'libaom-av1', '-still-picture', '1', '-update', '1', f('still.avif')]);
+  const whole = fs.readFileSync(f('raw.mp4'));
+  fs.writeFileSync(f('잘린파일.mp4'), whole.subarray(0, Math.floor(whole.length * 0.5)));
+  fs.writeFileSync(f('메모.txt'), 'hello');
+  const before = (await projectState()).media.length;
+  const added = await evalApp((p) => window.__wvm.actions.importPaths(p).then((r) => r.map((x) => x.name)), [f('잘린파일.mp4'), f('still.avif'), f('메모.txt')]);
+  assert.deepEqual(added, ['still.avif'], '구형 ffprobe 가 못 읽는 AVIF 도 들어온다');
+  assert.equal((await projectState()).media.length, before + 1);
+  const toastText = await page.locator('.toast.error').last().textContent();
+  assert.match(toastText, /잘린파일\.mp4: 파일이 완전히 저장되지 않았습니다/);
+  assert.match(toastText, /메모\.txt: 영상이나 소리가 들어 있지 않은/);
+  await evalApp((name) => {
+    const { store, actions } = window.__wvm;
+    actions.removeMedia(store.project.media.find((m) => m.name === name).id);
+  }, 'still.avif');
+});
+
+await step('폴더를 가져오면 안의 미디어만 이름 순서대로 들어온다', async () => {
+  const dir = f('폴더');
+  fs.mkdirSync(path.join(dir, '하위'), { recursive: true });
+  fs.copyFileSync(f('photo.png'), path.join(dir, '사진2.png'));
+  fs.copyFileSync(f('photo.png'), path.join(dir, '사진10.png'));
+  fs.copyFileSync(f('music.mp3'), path.join(dir, '하위', '소리.mp3'));
+  fs.writeFileSync(path.join(dir, '메모.txt'), 'x');
+  const names = await evalApp((p) => window.__wvm.actions.importPaths([p]).then((r) => r.map((m) => m.name)), dir);
+  assert.deepEqual(names, ['사진2.png', '사진10.png', '소리.mp3']);
+  await evalApp((n) => {
+    const { store, actions } = window.__wvm;
+    for (const name of n) actions.removeMedia(store.project.media.find((m) => m.name === name).id);
+  }, names);
+});
+
+await step('탐색기 파일을 타임라인에 놓으면 가져와서 그 자리에 차례로 놓인다', async () => {
+  const { x, y } = await rowCenter('V1');
+  await evalApp(([files, cx, cy]) => window.__wvm.timeline.placeFiles(files, cx, cy), [[f('portrait.mp4'), f('raw.mp4'), f('music.mp3')], x, y]);
+  const p = await projectState();
+  const v1 = track(p, 'V1').clips;
+  assert.equal(v1.length, 2);
+  assert.ok(Math.abs(v1[1].start - (v1[0].start + 4)) < 0.05, '두 번째 영상은 첫 영상 뒤에');
+  assert.equal(track(p, '음악').clips.length, 1, '음악은 오디오 트랙으로');
+  await undoAll(3);
+  await evalApp(() => {
+    const { store, actions } = window.__wvm;
+    const m = store.project.media.find((x) => x.name === 'raw.mp4');
+    if (m) actions.removeMedia(m.id);
+  });
+});
+
+await step('타임라인에 올린 오디오만 파형을 만든다', async () => {
+  const has = (name) => evalApp((n) => {
+    const { store } = window.__wvm;
+    return !!store.rt(store.project.media.find((m) => m.name === n).id).peaks;
+  }, name);
+  await page.locator('.media-card', { hasText: 'music.mp3' }).dblclick();
+  await page.waitForFunction(() => {
+    const { store } = window.__wvm;
+    return store.rt(store.project.media.find((m) => m.name === 'music.mp3').id).peaks;
+  }, null, { timeout: 30000 });
+  assert.equal(await has('music.mp3'), true);
+  await undoAll(1);
 });
 
 await step('더블클릭으로 이어 붙이기', async () => {

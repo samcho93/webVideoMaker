@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('api', {
   pickMedia: invoke('media:pick'),
   probe: invoke('media:probe'),
   allow: invoke('media:allow'),
+  expand: invoke('media:expand'),
+  poster: invoke('media:poster'),
   derive: invoke('media:derive'),
   peaks: invoke('media:peaks'),
   proxy: invoke('media:proxy'),

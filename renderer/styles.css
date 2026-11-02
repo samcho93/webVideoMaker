@@ -23,7 +23,7 @@
 html, body { height: 100%; margin: 0; }
 body {
   display: grid;
-  grid-template-rows: 44px minmax(0, 1fr) 320px;
+  grid-template-rows: 44px minmax(0, 1fr) min(var(--tl-height, 372px), calc(100vh - 284px));
   background: var(--bg);
   color: var(--text);
   font: 13px/1.4 "Malgun Gothic", "Segoe UI", sans-serif;
@@ -144,14 +144,18 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .cap-row .voice { font-size: 11px; color: var(--narration); margin-top: 2px; }
 
 /* 타임라인 */
-#timeline { display: flex; flex-direction: column; min-height: 0; background: var(--panel); border-top: 1px solid var(--line); }
+#timeline { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--panel); border-top: 1px solid var(--line); }
+#tlResizer { position: absolute; top: -4px; left: 0; right: 0; height: 8px; cursor: ns-resize; z-index: 20; }
+#tlResizer:hover, #tlResizer.active { background: #4d8dff66; }
 #tlToolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 14px; padding: 5px 8px; border-bottom: 1px solid var(--line); }
 #tlToolbar button { padding: 2px 8px; font-size: 12px; }
 #tlToolbar label { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 4px; }
 #tlToolbar select { padding: 1px 4px; font-size: 12px; }
 .spacer { margin-left: auto; }
 #tlBody { flex: 1; display: grid; grid-template-columns: 132px minmax(0, 1fr); min-height: 0; }
-#tlHeaders { padding-top: 26px; overflow: hidden; border-right: 1px solid var(--line); }
+#tlHeaders { overflow: hidden; border-right: 1px solid var(--line); }
+#tlCorner { position: sticky; top: 0; z-index: 6; height: 26px; display: flex; align-items: center; gap: 3px; padding: 0 3px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#tlCorner button { flex: 1; min-width: 0; height: 21px; padding: 0 2px; font-size: 11px; white-space: nowrap; }
 .tl-header { display: flex; align-items: center; gap: 2px; padding: 0 4px 0 8px; border-bottom: 1px solid var(--line); background: var(--panel); font-size: 12px; }
 .tl-header .tname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tl-header button { padding: 0 3px; font-size: 11px; background: transparent; border: 0; color: var(--dim); }
@@ -162,6 +166,8 @@ input[type="checkbox"] { accent-color: var(--accent); }
 #tlRulerCanvas { position: absolute; top: 0; left: 0; height: 26px; }
 .tl-row { position: relative; border-bottom: 1px solid var(--line); }
 .tl-row.drop { background: #4d8dff22; }
+.tl-drop-marker { position: absolute; top: 2px; bottom: 2px; background: #4d8dff55; border: 1px dashed #8fb6ff; border-radius: 3px; pointer-events: none; z-index: 5; }
+.import-status:empty { display: none; }
 .tl-row.locked { background: repeating-linear-gradient(45deg, #0000 0 8px, #ffffff08 8px 16px); }
 .clip {
   position: absolute; top: 2px; bottom: 2px; border-radius: 4px; overflow: hidden; cursor: grab;

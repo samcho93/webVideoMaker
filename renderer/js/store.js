@@ -4,6 +4,8 @@ import { createProject, findItem } from '/shared/model.mjs';
 
 const HISTORY_LIMIT = 200;
 const COALESCE_MS = 900;
+const MEDIA_RENDER_DELAY_MS = 60;
+const TIMELINE_RUNTIME_KEYS = ['sprite', 'spriteCount', 'peaks', 'missing'];
 const listeners = new Map();
 
 export const store = {
@@ -12,9 +14,13 @@ export const store = {
   dirty: false,
   selection: null, // 선택한 타임라인 항목 id
   range: { in: null, out: null },
-  /** mediaId → { proxy, exportPath, sprite, spriteCount, peaks, missing, proxyProgress } (저장하지 않음) */
+  /** mediaId → { proxy, playable, forceProxy, checking, exportPath, sprite, spriteCount, peaks, missing, proxyProgress } (저장하지 않음) */
   runtime: new Map(),
   clipboard: null,
+  /** 미디어함에서 끌고 있는 미디어 id */
+  draggingMedia: null,
+  /** 가져오기 진행 상황 { done, total } */
+  importing: null,
 
   on(event, fn) {
     if (!listeners.has(event)) listeners.set(event, new Set());
@@ -77,9 +83,23 @@ export const store = {
     return this.selection ? findItem(this.project, this.selection) : null;
   },
 
-  setRuntime(mediaId, patch) {
+  /** 변환 진행률처럼 자주 바뀌는 값은 해당 카드만 고치고, 나머지는 모아서 한 번에 다시 그린다 */
+  setRuntime(mediaId, patch, { progressOnly = false } = {}) {
     this.runtime.set(mediaId, { ...this.runtime.get(mediaId), ...patch });
-    this.emit('media');
+    if (progressOnly) {
+      this.emit('media-progress', mediaId);
+      return;
+    }
+    if (TIMELINE_RUNTIME_KEYS.some((key) => key in patch)) this._timelineStale = true;
+    if (this._mediaTimer) return;
+    this._mediaTimer = setTimeout(() => {
+      this._mediaTimer = null;
+      this.emit('media');
+      if (this._timelineStale) {
+        this._timelineStale = false;
+        this.emit('media-timeline');
+      }
+    }, MEDIA_RENDER_DELAY_MS);
   },
   rt(mediaId) {
     return this.runtime.get(mediaId) || {};
@@ -117,6 +137,7 @@ export const mediaUrl = (path) => `media://local/${encodeURIComponent(path)}`;
 export function previewPath(media) {
   const rt = store.rt(media.id);
   if (rt.missing) return null;
-  if (media.needsProxy) return rt.proxy || null;
+  if (rt.proxy) return rt.proxy;
+  if (rt.forceProxy || (media.needsProxy && !rt.playable)) return null;
   return rt.exportPath || media.path;
 }

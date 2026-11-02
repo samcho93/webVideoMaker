@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { FFMPEG, probe, readJpegOrientation, run, makePeaks, setCacheDir, makeProxy, makeSprite, normalizedImage } from '../../main/ffmpeg.mjs';
+import { FFMPEG, probe, readJpegOrientation, run, makePeaks, setCacheDir, makePoster, makeProxy, makeSprite, normalizedImage } from '../../main/ffmpeg.mjs';
 import { beginJob, runJob } from '../../main/exporter.mjs';
 import { createMask, createMediaClip, createProject, newId } from '../../shared/model.mjs';
 
@@ -254,12 +254,81 @@ test('EXIF 회전 사진을 똑바로 세운다', async () => {
   app1.writeUInt16BE(0xffe1, 0);
   app1.writeUInt16BE(payload.length + 2, 2);
   fs.writeFileSync(f('exif.jpg'), Buffer.concat([jpg.subarray(0, 2), app1, payload, jpg.subarray(2)]));
-  assert.equal(readJpegOrientation(f('exif.jpg')), 6);
+  assert.equal(await readJpegOrientation(f('exif.jpg')), 6);
   const info = await probe(f('exif.jpg'));
   assert.deepEqual([info.width, info.height], [200, 400]);
   const upright = await normalizedImage(f('exif.jpg'), 6);
   const out = await probe(upright);
   assert.deepEqual([out.width, out.height], [200, 400]);
+});
+
+test('H.264 는 다시 압축하지 않고 옮겨 담으며 소리만 변환한다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=3', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=3',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-shortest', '-f', 'mpegts', f('camera.mts')]);
+  const info = await probe(f('camera.mts'));
+  assert.equal(info.needsProxy, true);
+  assert.equal(info.canRemux, true);
+  const remux = await makeProxy(info);
+  assert.match(remux, /\.remux\.mp4$/);
+  const out = await probe(remux);
+  assert.equal(out.videoCodec, 'h264');
+  assert.equal(out.audioCodec, 'aac');
+  assert.deepEqual([out.width, out.height], [640, 360], '해상도를 줄이지 않고 그대로 옮긴다');
+  assert.ok(Math.abs(out.duration - 3) < 0.2, `길이 ${out.duration}`);
+  assert.ok(!out.needsProxy);
+  // 다시 압축을 요청하면 별도의 파일을 만든다
+  const proxy = await makeProxy(info, null, { transcode: true });
+  assert.match(proxy, /\.proxy\.mp4$/);
+});
+
+test('옮겨 담기가 실패하면 다시 압축으로 넘어간다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', f('ok.mp4')]);
+  const info = await probe(f('ok.mp4'));
+  const proxy = await makeProxy({ ...info, canRemux: true, videoCodec: 'h264', audioCodec: null, path: f('ok.mp4'), duration: 1 }, null);
+  assert.ok(fs.statSync(proxy).size > 0);
+  fs.writeFileSync(f('broken.mp4'), 'not a video');
+  await assert.rejects(makeProxy({ ...info, canRemux: true, path: f('broken.mp4') }), /ffmpeg/);
+});
+
+test('MP4 안의 PCM 소리는 미리보기 확인 대상으로 분류한다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-f', 'lavfi', '-i', 'sine=d=1',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'pcm_s16le', '-shortest', f('pcm.mov')]);
+  const info = await probe(f('pcm.mov'));
+  assert.equal(info.needsProxy, true);
+  assert.equal(info.canRemux, true);
+});
+
+test('대표 썸네일을 만들고, 캐시는 완성 표시가 있을 때만 다시 쓴다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=20', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '30', f('long.mp4')]);
+  const info = await probe(f('long.mp4'));
+  const poster = await makePoster(info, info.path);
+  const posterInfo = await probe(poster);
+  assert.deepEqual([posterInfo.width, posterInfo.height], [160, 90]);
+  assert.equal(await makePoster(info, info.path), poster);
+  // 만들다 끊긴 파일(완성 표시 없음)은 쓰지 않고 다시 만든다
+  fs.rmSync(`${poster}.done`);
+  fs.writeFileSync(poster, 'partial');
+  await makePoster(info, info.path);
+  assert.ok(fs.statSync(poster).size > 100);
+  assert.ok(fs.existsSync(`${poster}.done`));
+  assert.ok(!fs.readdirSync(path.dirname(poster)).some((n) => n.includes('.tmp')), '임시 파일을 남기지 않는다');
+});
+
+test('ffprobe 가 읽지 못하는 파일도 ffmpeg 으로 분석하고, 못 읽으면 이유를 알려 준다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'smptebars=s=320x240:d=1', '-frames:v', '1', '-c:v', 'libaom-av1', '-still-picture', '1', '-update', '1', f('still.avif')]);
+  const avif = await probe(f('still.avif'));
+  assert.equal(avif.type, 'image');
+  assert.deepEqual([avif.width, avif.height], [320, 240]);
+
+  fs.writeFileSync(f('memo.txt'), 'hello');
+  await assert.rejects(probe(f('memo.txt')), /영상이나 소리가 들어 있지 않은/);
+  fs.writeFileSync(f('empty.mp4'), '');
+  await assert.rejects(probe(f('empty.mp4')), /빈 파일/);
+  await assert.rejects(probe(f('no-such-file.mp4')), /찾을 수 없습니다/);
+  await assert.rejects(probe(TMP), /폴더/);
+  const whole = fs.readFileSync(f('long.mp4'));
+  fs.writeFileSync(f('truncated.mp4'), whole.subarray(0, Math.floor(whole.length / 2)));
+  await assert.rejects(probe(f('truncated.mp4')), /완전히 저장되지/);
 });
 
 test('프록시·썸네일·파형을 생성한다', async () => {

@@ -3,16 +3,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { makePeaks, makeProxy, makeSprite, normalizedImage, probe, setCacheDir } from './ffmpeg.mjs';
+import { makePeaks, makePoster, makeProxy, makeSprite, normalizedImage, probe, setCacheDir } from './ffmpeg.mjs';
 import { beginJob, cancelJob, runJob, writeAsset } from './exporter.mjs';
 import { listVoices, synthesize } from './tts.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PROJECT_FILTER = [{ name: 'WebVideoMaker 프로젝트', extensions: ['wvm'] }];
+const MEDIA_EXTENSIONS = [
+  'mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', 'wmv', 'asf', 'flv', 'f4v', 'mpg', 'mpeg', 'vob', 'ts', 'mts', 'm2ts', 'mxf', '3gp', '3g2', 'ogv',
+  'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'tga', 'avif', 'heic', 'heif',
+  'mp3', 'wav', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac', 'wma', 'aif', 'aiff', 'ac3', 'amr',
+];
 const MEDIA_FILTER = [
-  { name: '미디어 파일', extensions: ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'mts', '3gp', 'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'mp3', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'flac', 'wma'] },
+  { name: '미디어 파일', extensions: MEDIA_EXTENSIONS },
   { name: '모든 파일', extensions: ['*'] },
 ];
+const MAX_FOLDER_FILES = 500;
 const MIME = {
   '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/mp4', '.webm': 'video/webm', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4',
   '.aac': 'audio/aac', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac',
@@ -47,11 +53,12 @@ function serveApp(request) {
   return net.fetch(pathToFileURL(file).toString());
 }
 
-function serveMedia(request) {
+async function serveMedia(request) {
   const { pathname } = new URL(request.url);
   const file = decodeURIComponent(pathname.slice(1));
-  if (!isAllowed(file) || !fs.existsSync(file)) return new Response('Not found', { status: 404 });
-  const { size } = fs.statSync(file);
+  const stat = isAllowed(file) ? await fs.promises.stat(file).catch(() => null) : null;
+  if (!stat) return new Response('Not found', { status: 404 });
+  const { size } = stat;
   const headers = {
     'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
     'Accept-Ranges': 'bytes',
@@ -170,6 +177,38 @@ async function deriveAndAllow(fn) {
   return file;
 }
 
+/** 끌어다 놓은 폴더를 그 안의 미디어 파일 목록으로 펼친다 */
+async function expandPaths(paths) {
+  const extensions = new Set(MEDIA_EXTENSIONS.map((e) => `.${e}`));
+  const files = [];
+  const walk = async (dir) => {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    for (const entry of entries) {
+      if (files.length >= MAX_FOLDER_FILES) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else if (extensions.has(path.extname(entry.name).toLowerCase())) files.push(full);
+    }
+  };
+  for (const p of paths) {
+    const stat = await fs.promises.stat(p).catch(() => null);
+    if (stat?.isDirectory()) await walk(p);
+    else files.push(p);
+  }
+  return files;
+}
+
+async function uprightSource(info) {
+  if (info.type === 'image' && info.orientation > 1) return deriveAndAllow(() => normalizedImage(info.path, info.orientation));
+  return null;
+}
+
 function registerIpc() {
   ipcMain.handle('media:pick', async () => {
     const res = await dialog.showOpenDialog(win, { title: '미디어 가져오기', filters: MEDIA_FILTER, properties: ['openFile', 'multiSelections'] });
@@ -186,24 +225,26 @@ function registerIpc() {
     }
   })));
   // 미리보기·내보내기에 쓸 정규화 이미지와 썸네일
+  ipcMain.handle('media:expand', (_e, paths) => expandPaths(paths));
+  ipcMain.handle('media:poster', async (_e, info) => {
+    const exportPath = await uprightSource(info);
+    if (info.type === 'audio') return { exportPath, poster: null };
+    return { exportPath, poster: allow(await makePoster(info, exportPath || info.path)) };
+  });
   ipcMain.handle('media:derive', async (_e, info) => {
-    const result = { exportPath: null, sprite: null, spriteCount: 0 };
-    let source = info.path;
-    if (info.type === 'image' && info.orientation > 1) {
-      source = await deriveAndAllow(() => normalizedImage(info.path, info.orientation));
-      result.exportPath = source;
-    }
+    const exportPath = await uprightSource(info);
+    const result = { exportPath, sprite: null, spriteCount: 0 };
     if (info.type !== 'audio') {
-      const { file, count } = await makeSprite(info, source);
+      const { file, count } = await makeSprite(info, exportPath || info.path);
       result.sprite = allow(file);
       result.spriteCount = count;
     }
     return result;
   });
   ipcMain.handle('media:peaks', async (_e, info) => (info.hasAudio ? makePeaks(info) : null));
-  ipcMain.handle('media:proxy', (_e, mediaId, info) => deriveAndAllow(() => makeProxy(info, (progress) => {
+  ipcMain.handle('media:proxy', (_e, mediaId, info, options) => deriveAndAllow(() => makeProxy(info, (progress) => {
     win?.webContents.send('proxy:progress', { mediaId, progress });
-  })));
+  }, options)));
 
   ipcMain.handle('project:save', async (_e, { filePath, json, name }) => {
     let target = filePath;

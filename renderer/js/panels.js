@@ -20,62 +20,111 @@ function typeIcon(type) {
   return { video: '🎞', image: '🖼', audio: '🎵' }[type];
 }
 
-function renderMedia() {
-  const root = content();
-  const fragment = [
-    buttonRow(['＋ 미디어 가져오기', actions.importDialog, '비디오·사진·음악 파일을 불러옵니다 (Ctrl+I)']),
-  ];
-  const { media } = store.project;
-  if (!media.length) {
-    fragment.push(el('div', { class: 'empty', text: '파일을 이 창으로 끌어다 놓거나\n위 버튼으로 가져오세요.\n더블클릭하면 타임라인 끝에 붙습니다.' }));
-    fragment[1].style.whiteSpace = 'pre-line';
-  } else {
-    const grid = el('div', { class: 'media-grid' });
-    for (const m of media) grid.append(mediaCard(m));
-    fragment.push(grid, el('p', { class: 'hint', text: '더블클릭: 타임라인 끝에 붙이기 · 끌어다 놓기: 원하는 위치에 배치' }));
-  }
-  root.replaceChildren(...fragment);
+// 카드를 끄는 도중에 썸네일·진행률이 갱신되어도 끌기가 끊기지 않도록 카드 요소를 유지하고 내용만 고친다
+const cards = new Map(); // mediaId → { node, thumb, name, sub, badge }
+
+function importStatusText() {
+  return store.importing ? `미디어 읽는 중… ${store.importing.done} / ${store.importing.total}` : '';
 }
 
-function mediaCard(m) {
-  const rt = store.rt(m.id);
-  const thumb = el('div', { class: 'thumb' });
-  if (rt.sprite) {
-    thumb.style.backgroundImage = `url("${mediaUrl(rt.sprite)}")`;
-    if (rt.spriteCount > 1) {
-      thumb.style.backgroundSize = `${rt.spriteCount * 100}% 100%`;
-      thumb.style.backgroundPosition = '0 0';
+function renderMedia() {
+  const root = content();
+  const { media } = store.project;
+  let grid = root.querySelector(':scope > .media-grid');
+  if (!grid || !media.length) {
+    cards.clear();
+    const fragment = [
+      buttonRow(['＋ 미디어 가져오기', actions.importDialog, '비디오·사진·음악 파일을 불러옵니다 (Ctrl+I)']),
+      el('p', { class: 'hint import-status', text: importStatusText() }),
+    ];
+    if (!media.length) {
+      const empty = el('div', { class: 'empty', text: '파일이나 폴더를 이 창으로 끌어다 놓거나\n위 버튼으로 가져오세요.\n더블클릭하면 타임라인 끝에 붙습니다.' });
+      empty.style.whiteSpace = 'pre-line';
+      fragment.push(empty);
+    } else {
+      grid = el('div', { class: 'media-grid' });
+      fragment.push(grid, el('p', { class: 'hint', text: '더블클릭: 타임라인 끝에 붙이기 · 끌어다 놓기: 타임라인 어디든 놓으면 가까운 트랙에 배치' }));
     }
-  } else {
-    thumb.textContent = typeIcon(m.type);
+    root.replaceChildren(...fragment);
+    if (!media.length) return;
   }
-  let sub;
-  if (m.type === 'image') sub = `${m.width}×${m.height}`;
-  else if (m.type === 'audio') sub = formatHMS(m.duration);
-  else sub = `${m.width}×${m.height} · ${formatHMS(m.duration)}`;
-  let badge = null;
-  if (rt.missing) badge = '파일 없음';
-  else if (rt.proxyProgress !== undefined && rt.proxyProgress !== null) badge = `변환 ${Math.round(rt.proxyProgress * 100)}%`;
-  const card = el('div', {
-    class: `media-card${rt.missing ? ' missing' : ''}`,
-    draggable: !rt.missing,
-    title: m.path,
-    ondblclick: () => (rt.missing ? actions.relinkMedia(m.id) : actions.appendToTimeline(m.id)),
+  const ids = new Set(media.map((m) => m.id));
+  for (const [id, card] of cards) {
+    if (!ids.has(id)) {
+      card.node.remove();
+      cards.delete(id);
+    }
+  }
+  for (const m of media) {
+    if (!cards.has(m.id)) {
+      cards.set(m.id, mediaCard(m.id));
+      grid.append(cards.get(m.id).node);
+    }
+    updateCard(cards.get(m.id), m);
+  }
+  const order = media.map((m) => cards.get(m.id).node);
+  if (order.some((node, i) => grid.children[i] !== node)) grid.replaceChildren(...order);
+}
+
+function mediaCard(id) {
+  const thumb = el('div', { class: 'thumb' });
+  const name = el('div', { class: 'name' });
+  const sub = el('div', { class: 'sub' });
+  const badge = el('span', { class: 'badge' });
+  const node = el('div', {
+    class: 'media-card',
+    ondblclick: () => (store.rt(id).missing ? actions.relinkMedia(id) : actions.appendToTimeline(id)),
     ondragstart: (e) => {
-      e.dataTransfer.setData(`application/x-wvm-${m.type === 'audio' ? 'audio' : 'video'}`, m.id);
+      const m = store.project.media.find((item) => item.id === id);
+      if (!m) { e.preventDefault(); return; }
+      store.draggingMedia = id;
+      e.dataTransfer.setData(`application/x-wvm-${m.type === 'audio' ? 'audio' : 'video'}`, id);
       e.dataTransfer.effectAllowed = 'copy';
     },
+    ondragend: () => { store.draggingMedia = null; },
   },
   thumb,
-  el('div', { class: 'meta' }, el('div', { class: 'name', text: m.name }), el('div', { class: 'sub', text: sub })));
-  if (badge) card.append(el('span', { class: 'badge', text: badge }));
-  card.append(el('button', {
+  el('div', { class: 'meta' }, name, sub),
+  badge,
+  el('button', {
     class: 'remove danger',
     text: '✕',
     title: '미디어함과 타임라인에서 제거',
-    onclick: (e) => { e.stopPropagation(); actions.removeMedia(m.id); },
+    onclick: (e) => { e.stopPropagation(); actions.removeMedia(id); },
   }));
-  return card;
+  return { node, thumb, name, sub, badge, sprite: null };
+}
+
+function updateCard(card, m) {
+  const rt = store.rt(m.id);
+  const { node, thumb, badge } = card;
+  node.className = `media-card${rt.missing ? ' missing' : ''}`;
+  node.draggable = !rt.missing;
+  node.title = m.path;
+  card.name.textContent = m.name;
+  if (m.type === 'image') card.sub.textContent = `${m.width}×${m.height}`;
+  else if (m.type === 'audio') card.sub.textContent = formatHMS(m.duration);
+  else card.sub.textContent = `${m.width}×${m.height} · ${formatHMS(m.duration)}`;
+
+  if (rt.sprite !== card.sprite) {
+    card.sprite = rt.sprite ?? null;
+    if (rt.sprite) {
+      thumb.textContent = '';
+      thumb.style.backgroundImage = `url("${mediaUrl(rt.sprite)}")`;
+      thumb.style.backgroundSize = rt.spriteCount > 1 ? `${rt.spriteCount * 100}% 100%` : '';
+      thumb.style.backgroundPosition = rt.spriteCount > 1 ? '0 0' : '';
+    } else {
+      thumb.style.backgroundImage = '';
+    }
+  }
+  if (!rt.sprite) thumb.textContent = typeIcon(m.type);
+
+  let text = '';
+  if (rt.missing) text = '파일 없음';
+  else if (rt.checking) text = '재생 확인 중';
+  else if (rt.proxyProgress !== undefined && rt.proxyProgress !== null) text = `변환 ${Math.round(rt.proxyProgress * 100)}%`;
+  badge.textContent = text;
+  badge.style.display = text ? '' : 'none';
 }
 
 function addOverlay(item) {
@@ -284,8 +333,17 @@ export function bindPanels() {
   store.on('project', () => { if (activeTab === 'media' || activeTab === 'captions') renderPanel(); });
   store.on('media', () => { if (activeTab === 'media') renderPanel(); });
   store.on('selection', () => { if (activeTab === 'captions') renderPanel(); });
+  store.on('importing', () => {
+    const status = activeTab === 'media' ? content().querySelector('.import-status') : null;
+    if (status) status.textContent = importStatusText();
+  });
+  store.on('media-progress', (mediaId) => {
+    const card = cards.get(mediaId);
+    const m = store.project.media.find((item) => item.id === mediaId);
+    if (activeTab === 'media' && card && m) updateCard(card, m);
+  });
   window.api.onProxyProgress(({ mediaId, progress }) => {
-    if (store.rt(mediaId).proxyProgress !== null) store.setRuntime(mediaId, { proxyProgress: progress });
+    if (store.rt(mediaId).proxyProgress !== null) store.setRuntime(mediaId, { proxyProgress: progress }, { progressOnly: true });
   });
   renderPanel();
 }

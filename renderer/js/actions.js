@@ -5,10 +5,12 @@ import {
   MIN_ITEM_DURATION, newId, normalizeProject, SPEED_MAX, SPEED_MIN, trackEnd,
 } from '/shared/model.mjs';
 import { parseNarration, parseSrt, serializeNarration, serializeSrt } from '/shared/narration.mjs';
-import { store } from './store.js';
+import { mediaUrl, store } from './store.js';
 import { toast } from './ui.js';
 
 const EPS = 1e-4;
+const PLAY_TEST_TIMEOUT_MS = 8000;
+const MAX_FAILURE_LINES = 4;
 let preview = null;
 export const setPreview = (p) => { preview = p; };
 export const playhead = () => preview.time;
@@ -16,49 +18,195 @@ export const seekTo = (t) => preview.seek(t);
 
 // ── 미디어 ──
 
+const peaksRequested = new Set();
+const proxyStarted = new Set();
+// 재생 시험은 한 번에 하나씩 한다
+let playTestChain = Promise.resolve();
+
 function deriveMedia(media) {
   const info = { ...media };
-  window.api.derive(info).then((res) => {
-    store.setRuntime(media.id, { exportPath: res.exportPath, sprite: res.sprite, spriteCount: res.spriteCount });
-  }).catch((err) => console.warn('썸네일 생성 실패', media.name, err));
-  if (media.hasAudio) {
-    window.api.peaks(info).then((peaks) => store.setRuntime(media.id, { peaks })).catch((err) => console.warn('파형 생성 실패', media.name, err));
-  }
-  if (media.needsProxy) {
-    store.setRuntime(media.id, { proxyProgress: 0 });
-    window.api.proxy(media.id, info).then((proxy) => {
-      store.setRuntime(media.id, { proxy, proxyProgress: null });
-    }).catch((err) => {
-      store.setRuntime(media.id, { proxyProgress: null, proxyFailed: true });
-      toast(`미리보기 변환 실패: ${media.name}\n${err.message}`, { error: true });
-    });
+  peaksRequested.delete(media.id);
+  proxyStarted.delete(media.id);
+  // 대표 썸네일을 먼저 보여 주고, 타임라인용 썸네일 묶음은 뒤에서 만든다
+  window.api.poster(info).then((res) => {
+    const patch = { exportPath: res.exportPath };
+    if (res.poster && !store.rt(media.id).sprite) Object.assign(patch, { sprite: res.poster, spriteCount: 1 });
+    store.setRuntime(media.id, patch);
+  }).catch((err) => console.warn('대표 썸네일 생성 실패', media.name, err))
+    .then(() => window.api.derive(info))
+    .then((res) => {
+      const patch = { exportPath: res.exportPath };
+      if (res.sprite) Object.assign(patch, { sprite: res.sprite, spriteCount: res.spriteCount });
+      store.setRuntime(media.id, patch);
+    })
+    .catch((err) => console.warn('썸네일 생성 실패', media.name, err));
+  if (media.needsProxy) preparePreview(media, info);
+}
+
+/** 타임라인에 올라간 미디어의 파형을 필요할 때 만든다 */
+export function ensurePeaks(media) {
+  if (!media.hasAudio || store.rt(media.id).peaks || peaksRequested.has(media.id)) return;
+  peaksRequested.add(media.id);
+  window.api.peaks({ ...media }).then((peaks) => store.setRuntime(media.id, { peaks }))
+    .catch((err) => console.warn('파형 생성 실패', media.name, err));
+}
+
+/** 실제로 열어서 영상과 소리가 모두 해독되는지 확인한다 */
+function testPlayback(path, media) {
+  const attempt = () => new Promise((resolve) => {
+    const node = document.createElement(media.type === 'audio' ? 'audio' : 'video');
+    let timer = null;
+    let finished = false;
+    const finish = (ok) => {
+      finished = true;
+      clearTimeout(timer);
+      node.onerror = null;
+      node.onloadeddata = null;
+      node.onseeked = null;
+      node.pause();
+      node.removeAttribute('src');
+      node.load();
+      resolve(ok);
+    };
+    timer = setTimeout(() => finish(false), PLAY_TEST_TIMEOUT_MS);
+    node.crossOrigin = 'anonymous';
+    node.muted = true;
+    node.onerror = () => finish(false);
+    node.onloadeddata = () => {
+      if (media.type === 'video' && !node.videoWidth) { finish(false); return; }
+      node.onseeked = () => {
+        node.onseeked = null;
+        node.play().catch(() => {});
+        const check = () => {
+          if (finished) return;
+          const video = media.type !== 'video' || node.webkitDecodedFrameCount > 0;
+          const audio = !media.hasAudio || node.webkitAudioDecodedByteCount > 0;
+          if (video && audio) finish(true);
+          else setTimeout(check, 50);
+        };
+        check();
+      };
+      node.currentTime = Math.min(media.duration * 0.5, Math.max(0, media.duration - 0.5));
+    };
+    node.src = mediaUrl(path);
+  });
+  const result = playTestChain.then(attempt);
+  playTestChain = result.catch(() => {});
+  return result;
+}
+
+async function buildProxy(media, info, { transcode = false } = {}) {
+  store.setRuntime(media.id, { proxyProgress: 0 });
+  try {
+    let proxy = await window.api.proxy(media.id, info, { transcode });
+    // 옮겨 담은 파일이 재생되지 않으면 다시 압축한다
+    if (info.canRemux && !transcode && !await testPlayback(proxy, info)) {
+      store.setRuntime(media.id, { proxyProgress: 0 });
+      proxy = await window.api.proxy(media.id, info, { transcode: true });
+    }
+    store.setRuntime(media.id, { proxy, proxyProgress: null });
+  } catch (err) {
+    store.setRuntime(media.id, { proxyProgress: null, proxyFailed: true });
+    toast(`미리보기 변환 실패: ${media.name}\n${err.message}`, { error: true });
   }
 }
 
-/** 파일을 미디어함에 추가하고 추가된(또는 기존) 미디어를 돌려준다 */
-export async function importPaths(paths) {
-  const results = await window.api.probe(paths);
-  const added = [];
-  const fresh = [];
-  for (const res of results) {
-    if (!res.ok) {
-      toast(`가져오기 실패: ${res.path.split(/[\\/]/).pop()}\n지원하지 않는 파일입니다.`, { error: true });
-      continue;
-    }
-    const existing = store.project.media.find((m) => m.path === res.info.path);
-    if (existing) {
-      added.push(existing);
-    } else {
-      const media = { ...res.info, id: newId('med') };
-      added.push(media);
-      fresh.push(media);
-    }
+/** 원본이 바로 재생되면 변환하지 않는다. 안 되면 가장 빠른 방법으로 미리보기 파일을 만든다 */
+async function preparePreview(media, info) {
+  if (media.type !== 'image') {
+    store.setRuntime(media.id, { checking: true });
+    const playable = await testPlayback(media.path, info);
+    store.setRuntime(media.id, { checking: false, playable });
+    if (playable) return;
   }
-  if (fresh.length) {
-    store.mutate((p) => p.media.push(...fresh));
-    fresh.forEach(deriveMedia);
+  proxyStarted.add(media.id);
+  await buildProxy(media, info);
+}
+
+/** 미리보기 재생이 실패했을 때 호출한다. 프록시를 만들거나, 프록시가 문제면 다시 압축한다 */
+export function reportPlaybackError(media, path) {
+  const rt = store.rt(media.id);
+  if (rt.proxyFailed || rt.missing) return;
+  const proxyBroke = rt.proxy && rt.proxy === path;
+  if (proxyBroke && !rt.retranscoded) {
+    store.setRuntime(media.id, { proxy: null, forceProxy: true, retranscoded: true });
+    buildProxy(media, { ...media }, { transcode: true });
+    return;
+  }
+  if (proxyBroke || proxyStarted.has(media.id)) return;
+  proxyStarted.add(media.id);
+  store.setRuntime(media.id, { forceProxy: true, playable: false });
+  buildProxy(media, { ...media });
+}
+
+/** 파일을 미디어함에 추가하고 추가된(또는 기존) 미디어를 돌려준다. 분석이 끝나는 대로 고른 순서에 맞춰 나타난다 */
+export async function importPaths(paths) {
+  const files = await window.api.expand(paths);
+  if (!files.length) {
+    if (paths.length) toast('폴더 안에 가져올 미디어 파일이 없습니다.', { error: true });
+    return [];
+  }
+  const results = new Array(files.length);
+  const added = [];
+  const failed = [];
+  const coalesce = `import-${newId('batch')}`;
+  let next = 0;
+  let done = 0;
+  const flush = () => {
+    const fresh = [];
+    while (next < files.length && results[next]) {
+      const res = results[next];
+      next += 1;
+      if (!res.ok) {
+        failed.push(res);
+        continue;
+      }
+      const existing = [...store.project.media, ...fresh].find((m) => m.path === res.info.path);
+      const media = existing || { ...res.info, id: newId('med') };
+      added.push(media);
+      if (!existing) fresh.push(media);
+    }
+    if (fresh.length) {
+      store.mutate((p) => p.media.push(...fresh), { coalesce });
+      fresh.forEach(deriveMedia);
+    }
+  };
+  const setImporting = (value) => {
+    store.importing = value;
+    store.emit('importing');
+  };
+  setImporting({ done, total: files.length });
+  await Promise.all(files.map(async (file, i) => {
+    try {
+      [results[i]] = await window.api.probe([file]);
+    } catch (err) {
+      results[i] = { ok: false, path: file, error: err.message };
+    }
+    done += 1;
+    setImporting({ done, total: files.length });
+    flush();
+  }));
+  setImporting(null);
+  if (failed.length) {
+    const lines = failed.slice(0, MAX_FAILURE_LINES).map((res) => `${res.path.split(/[\\/]/).pop()}: ${res.error}`);
+    if (failed.length > MAX_FAILURE_LINES) lines.push(`외 ${failed.length - MAX_FAILURE_LINES}개`);
+    toast(`가져오기 실패\n${lines.join('\n')}`, { error: true });
   }
   return added;
+}
+
+/** 탐색기에서 타임라인으로 끌어온 파일을 가져와서 놓은 위치부터 차례로 배치한다 */
+export async function importAndPlace(paths, trackFor, start) {
+  const medias = await importPaths(paths);
+  const cursor = { video: start, audio: start };
+  for (const media of medias) {
+    const kind = media.type === 'audio' ? 'audio' : 'video';
+    const trackId = trackFor(kind);
+    if (!trackId) continue;
+    const clip = placeOnTrack(media.id, trackId, cursor[kind]);
+    if (clip) cursor[kind] = itemEnd(clip);
+  }
+  return medias;
 }
 
 export async function importDialog() {
@@ -87,10 +235,11 @@ export function appendToTimeline(mediaId) {
 export function placeOnTrack(mediaId, trackId, start) {
   const media = findMedia(store.project, mediaId);
   const track = store.project.tracks.find((t) => t.id === trackId);
-  if (!media || !track || track.locked) return;
+  if (!media || !track || track.locked) return null;
   const clip = createMediaClip(media, Math.max(0, start));
   store.mutate(() => track.clips.push(clip));
   store.select(clip.id);
+  return clip;
 }
 
 export function removeMedia(mediaId) {
@@ -519,7 +668,7 @@ export async function relinkMedia(mediaId) {
   const picked = await window.api.pickRelink(media.name);
   if (!picked) return;
   const [res] = await window.api.probe([picked]);
-  if (!res.ok) { toast('열 수 없는 파일입니다.', { error: true }); return; }
+  if (!res.ok) { toast(`열 수 없는 파일입니다.\n${res.error}`, { error: true }); return; }
   store.mutate(() => Object.assign(media, { ...res.info, id: media.id }));
   store.setRuntime(media.id, { missing: false });
   deriveMedia(media);

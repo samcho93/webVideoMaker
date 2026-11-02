@@ -24,7 +24,8 @@ store.on('selection', () => {
   document.querySelectorAll('.clip.selected').forEach((n) => n.classList.remove('selected'));
   if (store.selection) document.querySelector(`.clip[data-item-id="${store.selection}"]`)?.classList.add('selected');
 });
-store.on('media', () => timeline.render());
+store.on('media', () => preview.invalidate());
+store.on('media-timeline', () => timeline.render());
 store.on('range', () => timeline.updateRange());
 store.on('title', (name) => { document.getElementById('projectName').textContent = name; });
 

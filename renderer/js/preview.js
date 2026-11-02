@@ -3,6 +3,7 @@
 import { computeClipLayout, coverSize, fadeFactor, maskPositionAt } from '/shared/layout.mjs';
 import { findMedia, itemDuration, itemEnd, projectDuration } from '/shared/model.mjs';
 import { formatFrames, formatHMS } from '/shared/time.mjs';
+import { reportPlaybackError } from './actions.js';
 import { mediaUrl, previewPath, store } from './store.js';
 import { rasterizeCaption, rasterizeOverlay } from './raster.js';
 
@@ -103,21 +104,32 @@ export class Preview {
     if (slot) this.release(clip.id);
 
     const pool = this.free.get(path);
-    const el = pool?.pop() || this.createElement(media.type, path);
+    const el = pool?.pop() || this.createElement(media, path);
     const fresh = { el, path, gain: el.__gain };
     this.slots.set(clip.id, fresh);
     return fresh;
   }
 
-  createElement(type, path) {
-    const el = document.createElement(type === 'audio' ? 'audio' : 'video');
+  createElement(media, path) {
+    const el = document.createElement(media.type === 'audio' ? 'audio' : 'video');
+    const { id } = media;
+    const failed = () => {
+      // 재생 시험을 통과했어도 재생 중에 실패할 수 있다. 미리보기 파일로 바꾼다
+      const current = findMedia(store.project, id);
+      if (current) reportPlaybackError(current, path);
+      this.invalidate();
+    };
     el.crossOrigin = 'anonymous';
     el.preload = 'auto';
     el.playsInline = true;
     el.src = mediaUrl(path);
     el.addEventListener('seeked', () => this.invalidate());
-    el.addEventListener('loadeddata', () => this.invalidate());
+    el.addEventListener('loadeddata', () => {
+      if (media.type === 'video' && !el.videoWidth) failed();
+      this.invalidate();
+    });
     el.addEventListener('canplay', () => this.invalidate());
+    el.addEventListener('error', failed);
     return el;
   }
 
@@ -282,7 +294,7 @@ export class Preview {
     if (!source || !srcW || (source.readyState !== undefined && source.readyState < 2)) {
       ctx.fillStyle = '#20242c';
       ctx.fillRect(L.cx - L.bboxW / 2, L.cy - L.bboxH / 2, L.bboxW, L.bboxH);
-      if (media.needsProxy && !previewPath(media)) {
+      if (!previewPath(media)) {
         ctx.fillStyle = '#99a0b0';
         ctx.font = `${Math.round(H / 24)}px "Malgun Gothic"`;
         ctx.textAlign = 'center';
