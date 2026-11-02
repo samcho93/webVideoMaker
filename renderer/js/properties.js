@@ -345,7 +345,7 @@ function renderProject() {
     el('p', {
       class: 'hint',
       style: 'white-space:pre-line',
-      text: 'Space 재생/일시정지\nS 자르기 · Delete 삭제\nI / O 구간 시작 / 끝\n← → 한 프레임 (Shift: 1초)\nHome / End 처음 / 끝\nCtrl+C / V 복사 / 붙여넣기\nCtrl+Z / Y 실행 취소 / 다시\nCtrl+휠 타임라인 확대',
+      text: 'Space 재생/일시정지\nS 자르기 · Delete 삭제\nI / O 구간 시작 / 끝\n← → 한 프레임 (Shift: 1초)\nHome / End 처음 / 끝\nPageUp / PageDown 이전 / 다음 구간\n\\ 전체 보기 · Shift+\\ 선택 보기\nCtrl+C / V 복사 / 붙여넣기\nCtrl+Z / Y 실행 취소 / 다시\n휠 타임라인 확대·축소\nShift+휠 좌우 · Alt+휠 위아래 이동\n빈 곳·가운데 버튼 끌기 화면 이동',
     }),
   );
   box().replaceChildren(...parts);

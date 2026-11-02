@@ -90,7 +90,13 @@
         </label>
         <button id="tlApplySpeed" title="선택 클립의 지정 구간(없으면 클립 전체)에 속도 적용">구간 속도 적용</button>
       </div>
-      <label class="spacer" title="타임라인 확대/축소 (Ctrl+휠)">확대 <input id="tlZoom" type="range" min="0" max="100" value="45"></label>
+      <div class="group">
+        <button id="tlPrevSection" title="이전 구간 경계로 이동 (PageUp, ↑)">⏴ 이전 구간</button>
+        <button id="tlNextSection" title="다음 구간 경계로 이동 (PageDown, ↓)">다음 구간 ⏵</button>
+        <button id="tlFit" title="프로젝트 전체를 한 화면에 (\)">전체 보기</button>
+        <button id="tlShowSelection" title="지정한 구간 또는 선택한 항목을 화면에 맞춤 (Shift+\)">선택 보기</button>
+      </div>
+      <label class="spacer" title="휠: 확대·축소 · Shift+휠: 좌우 이동 · Alt+휠: 위아래 이동">확대 <input id="tlZoom" type="range" min="0" max="100" step="0.1" value="45"></label>
     </div>
     <div id="tlBody">
       <div id="tlHeaders"></div>

@@ -2,7 +2,7 @@
 
 import {
   createCaption, createMediaClip, createProject, findMedia, isMediaClip, itemDuration, itemEnd,
-  MIN_ITEM_DURATION, newId, normalizeProject, SPEED_MAX, SPEED_MIN, trackEnd,
+  MIN_ITEM_DURATION, newId, normalizeProject, projectDuration, SPEED_MAX, SPEED_MIN, trackEnd,
 } from '/shared/model.mjs';
 import { splitMaskKeyframes } from '/shared/layout.mjs';
 import { parseNarration, parseSrt, serializeNarration, serializeSrt } from '/shared/narration.mjs';
@@ -140,6 +140,28 @@ export function reportPlaybackError(media, path) {
   buildProxy(media, { ...media });
 }
 
+/** 재생 위치를 앞뒤 구간 경계(클립·효과의 시작과 끝, 지정 구간)로 옮긴다 */
+export function jumpSection(direction) {
+  const { project, range } = store;
+  const edges = new Set([0, projectDuration(project)]);
+  for (const track of project.tracks) {
+    if (track.type === 'caption') continue;
+    for (const item of track.clips) {
+      edges.add(item.start);
+      edges.add(itemEnd(item));
+    }
+  }
+  if (range.in !== null) edges.add(range.in);
+  if (range.out !== null) edges.add(range.out);
+  const sorted = [...edges].sort((a, b) => a - b);
+  const now = preview.time;
+  const target = direction > 0 ? sorted.find((t) => t > now + EPS) : sorted.reverse().find((t) => t < now - EPS);
+  if (target === undefined) return;
+  preview.pause();
+  preview.seek(target);
+  store.emit('reveal-time', target);
+}
+
 /** 파일을 미디어함에 추가하고 추가된(또는 기존) 미디어를 돌려준다. 분석이 끝나는 대로 고른 순서에 맞춰 나타난다 */
 export async function importPaths(paths) {
   const files = await window.api.expand(paths);
@@ -231,6 +253,7 @@ export function appendToTimeline(mediaId) {
   const clip = createMediaClip(media, trackEnd(track));
   store.mutate(() => track.clips.push(clip));
   store.select(clip.id);
+  store.emit('fit-timeline');
 }
 
 export function placeOnTrack(mediaId, trackId, start) {
@@ -648,6 +671,7 @@ export async function loadProjectJson(json, filePath) {
   for (const media of project.media) if (!missing.includes(media.id)) deriveMedia(media);
   preview.pause();
   preview.seek(0);
+  store.emit('fit-timeline');
   if (missing.length) toast(`찾지 못한 미디어 ${missing.length}개는 내보내기 전에 다시 연결해야 합니다.`, { error: true });
 }
 

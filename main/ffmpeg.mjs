@@ -3,7 +3,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import ffmpegStatic from 'ffmpeg-static';
 import ffprobeStatic from 'ffprobe-static';
@@ -52,13 +51,9 @@ const spriteSlots = createQueue(1);
 const peakSlots = createQueue(1);
 const proxySlots = createQueue(2);
 
-export function run(bin, args, { onStdout, signal, background = false } = {}) {
+export function run(bin, args, { onStdout, signal } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args, { windowsHide: true, signal });
-    if (background && proc.pid) {
-      // 편집 화면과 재생이 먼저 돌도록 뒤로 양보한다
-      try { os.setPriority(proc.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* 이미 끝난 프로세스 */ }
-    }
     const out = [];
     let err = '';
     proc.stdout.on('data', (d) => (onStdout ? onStdout(d) : out.push(d)));
@@ -337,7 +332,6 @@ export async function makeProxy(info, onProgress, { transcode = false } = {}) {
     const target = await cachePath(info.path, '.remux.mp4');
     try {
       return await once(target, () => proxySlots(() => cached(target, (tmp) => run(FFMPEG, remuxArgs(info, tmp), {
-        background: true,
         onStdout: progressReporter(info, onProgress),
       }))));
     } catch { /* 옮겨 담을 수 없는 파일은 아래에서 다시 압축한다 */ }
@@ -353,7 +347,7 @@ export async function makeProxy(info, onProgress, { transcode = false } = {}) {
     } else {
       args = transcodeArgs(info, tmp);
     }
-    await run(FFMPEG, args, { background: true, onStdout: progressReporter(info, onProgress) });
+    await run(FFMPEG, args, { onStdout: progressReporter(info, onProgress) });
   })));
 }
 
@@ -388,7 +382,7 @@ export async function makeSprite(info, sourcePath) {
     }
     const rate = count / Math.max(info.duration, 0.1);
     const attempt = (pre) => run(FFMPEG, ['-y', ...pre, '-i', sourcePath, '-an',
-      '-vf', `fps=${rate.toFixed(5)},${THUMB_BOX},tile=${count}x1`, '-frames:v', '1', '-update', '1', tmp], { background: true });
+      '-vf', `fps=${rate.toFixed(5)},${THUMB_BOX},tile=${count}x1`, '-frames:v', '1', '-update', '1', tmp]);
     // 키프레임만 읽으면 빠르지만, 키프레임이 드문 파일은 전체 디코딩으로 다시 시도한다.
     try {
       await attempt(['-skip_frame', 'nokey']);
@@ -409,7 +403,6 @@ export async function makePeaks(info) {
     const window = Math.round(8000 / PEAKS_PER_SECOND);
     let carry = Buffer.alloc(0);
     await run(FFMPEG, ['-v', 'error', '-i', info.path, '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', 'pipe:1'], {
-      background: true,
       onStdout: (chunk) => {
         const buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
         const frames = Math.floor(buf.length / 2 / window);

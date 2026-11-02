@@ -27,6 +27,8 @@ store.on('selection', () => {
 store.on('media', () => preview.invalidate());
 store.on('media-timeline', () => timeline.render());
 store.on('range', () => timeline.updateRange());
+store.on('fit-timeline', () => timeline.fit());
+store.on('reveal-time', (t) => timeline.reveal(t));
 store.on('title', (name) => { document.getElementById('projectName').textContent = name; });
 
 bindPanels();
@@ -79,6 +81,10 @@ on('tlIn', () => setRange('in', preview.time));
 on('tlOut', () => setRange('out', preview.time));
 on('tlClear', () => { store.range = { in: null, out: null }; store.emit('range'); });
 on('tlCutRange', actions.cutRange);
+on('tlPrevSection', () => actions.jumpSection(-1));
+on('tlNextSection', () => actions.jumpSection(1));
+on('tlFit', () => timeline.fit());
+on('tlShowSelection', () => timeline.showSelection());
 on('tlApplySpeed', () => actions.applySpeedToRange(+document.getElementById('tlSpeed').value));
 
 window.addEventListener('keydown', (e) => {
@@ -92,6 +98,11 @@ window.addEventListener('keydown', (e) => {
     case 'ArrowRight': preview.seek(preview.time + step); break;
     case 'Home': preview.seek(0); break;
     case 'End': preview.seek(preview.duration); break;
+    case 'PageUp':
+    case 'ArrowUp': actions.jumpSection(-1); break;
+    case 'PageDown':
+    case 'ArrowDown': actions.jumpSection(1); break;
+    case 'Backslash': if (e.shiftKey) timeline.showSelection(); else timeline.fit(); break;
     case 'KeyS': if (!ctrl) actions.splitAtPlayhead(); else return; break;
     case 'KeyI': if (!ctrl) setRange('in', preview.time); else return; break;
     case 'KeyO': if (!ctrl) setRange('out', preview.time); else return; break;

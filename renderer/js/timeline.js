@@ -2,7 +2,7 @@
 
 import { findMedia, isMediaClip, itemDuration, itemEnd, MIN_ITEM_DURATION, projectDuration } from '/shared/model.mjs';
 import { trimMaskStart } from '/shared/layout.mjs';
-import { formatHMS } from '/shared/time.mjs';
+import { formatHMS, formatPrecise } from '/shared/time.mjs';
 import { mediaUrl, store } from './store.js';
 import { el, toast } from './ui.js';
 import { addTrack, ensurePeaks, importAndPlace, placeOnTrack, removeTrack } from './actions.js';
@@ -17,8 +17,12 @@ const TL_MIN_HEIGHT = 180;
 const WORKSPACE_MIN_HEIGHT = 240;
 const TOPBAR_HEIGHT = 44;
 const THUMB_W = 96;
-const zoomFromSlider = (v) => 2 * 150 ** (v / 100); // 2 ~ 300 px/초
-const sliderFromZoom = (z) => (Math.log(z / 2) / Math.log(150)) * 100;
+const INITIAL_ZOOM = 19; // px/초
+const MAX_ZOOM = 1200; // 30fps 기준 프레임당 40px
+const COMFORT_MIN_ZOOM = 2;
+const FIT_TAIL_PX = 120;
+const PAN_THRESHOLD_PX = 4;
+const WHEEL_ZOOM_RATE = 0.0015;
 
 const trackClass = (track, media) => {
   if (track.type === 'video') return media?.type === 'image' ? 'image' : 'video';
@@ -36,7 +40,8 @@ function itemLabel(track, item, media) {
 export class Timeline {
   constructor(preview) {
     this.preview = preview;
-    this.zoom = zoomFromSlider(45);
+    this.zoom = INITIAL_ZOOM;
+    this.longClips = [];
     this.scroll = document.getElementById('tlScroll');
     this.content = document.getElementById('tlContent');
     this.rows = document.getElementById('tlRows');
@@ -51,18 +56,15 @@ export class Timeline {
   }
 
   bind() {
-    this.zoomInput.addEventListener('input', () => this.setZoom(zoomFromSlider(+this.zoomInput.value)));
+    this.zoomInput.addEventListener('input', () => this.setZoom(this.zoomFromSlider(+this.zoomInput.value)));
     this.scroll.addEventListener('scroll', () => {
       this.headers.scrollTop = this.scroll.scrollTop;
       this.drawRuler();
+      this.repaintLongClips();
     });
-    this.scroll.addEventListener('wheel', (e) => {
-      if (!e.ctrlKey) return;
-      e.preventDefault();
-      this.setZoom(Math.min(300, Math.max(2, this.zoom * (e.deltaY < 0 ? 1.15 : 0.87))));
-      this.zoomInput.value = sliderFromZoom(this.zoom);
-    }, { passive: false });
-    new ResizeObserver(() => this.drawRuler()).observe(this.scroll);
+    this.bindWheel();
+    this.bindPan();
+    new ResizeObserver(() => { this.drawRuler(); this.repaintLongClips(); }).observe(this.scroll);
 
     // 눈금자 클릭·끌기로 재생 위치 이동
     this.ruler.addEventListener('pointerdown', (e) => {
@@ -76,14 +78,91 @@ export class Timeline {
       this.ruler.addEventListener('pointermove', seek);
       this.ruler.addEventListener('pointerup', up);
     });
-    // 빈 곳 클릭: 선택 해제와 위치 이동
-    this.rows.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('.clip')) return;
-      store.select(null);
-      this.preview.seek(this.timeAt(e.clientX));
-    });
     this.bindDrop();
     this.bindResizer();
+  }
+
+  bindWheel() {
+    this.scroll.addEventListener('wheel', (e) => {
+      // 터치패드의 가로 쓸기는 그대로 둔다
+      if (!e.shiftKey && !e.altKey && Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      e.preventDefault();
+      if (e.shiftKey) {
+        this.scroll.scrollLeft += e.deltaY || e.deltaX;
+      } else if (e.altKey) {
+        this.scroll.scrollTop += e.deltaY;
+      } else {
+        this.queueWheelZoom(e.deltaY, e.clientX);
+      }
+    }, { passive: false });
+    this.headers.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      this.scroll.scrollTop += e.deltaY;
+    }, { passive: false });
+  }
+
+  /** 한 화면 갱신에 한 번만 다시 그린다 */
+  queueWheelZoom(deltaY, clientX) {
+    this.wheelDelta = (this.wheelDelta || 0) + deltaY;
+    this.wheelX = clientX;
+    if (this.wheelFrame) return;
+    this.wheelFrame = requestAnimationFrame(() => {
+      this.wheelFrame = null;
+      const factor = Math.exp(-this.wheelDelta * WHEEL_ZOOM_RATE);
+      this.wheelDelta = 0;
+      this.setZoom(this.zoom * factor, this.wheelX);
+    });
+  }
+
+  /** 가운데 버튼·Alt+끌기, 빈 곳 끌기로 화면을 옮긴다. 빈 곳을 끌지 않고 클릭하면 위치 이동이다 */
+  bindPan() {
+    this.scroll.addEventListener('mousedown', (e) => {
+      if (e.button === 1) e.preventDefault(); // 브라우저 자동 스크롤을 막는다
+    });
+    this.scroll.addEventListener('pointerdown', (e) => {
+      if (e.button === 1 || (e.button === 0 && e.altKey)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.startPan(e);
+      }
+    }, { capture: true });
+    this.rows.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || e.target.closest('.clip')) return;
+      this.startPan(e, () => {
+        store.select(null);
+        this.preview.seek(this.timeAt(e.clientX));
+      });
+    });
+  }
+
+  startPan(e, onClick = null) {
+    const { scroll } = this;
+    const fromLeft = scroll.scrollLeft;
+    const fromTop = scroll.scrollTop;
+    let panning = false;
+    scroll.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      const dx = ev.clientX - e.clientX;
+      const dy = ev.clientY - e.clientY;
+      if (!panning && Math.hypot(dx, dy) < PAN_THRESHOLD_PX) return;
+      panning = true;
+      scroll.classList.add('panning');
+      scroll.scrollLeft = fromLeft - dx;
+      scroll.scrollTop = fromTop - dy;
+    };
+    const end = () => {
+      scroll.removeEventListener('pointermove', move);
+      scroll.removeEventListener('pointerup', up);
+      scroll.removeEventListener('pointercancel', end);
+      scroll.classList.remove('panning');
+    };
+    const up = () => {
+      end();
+      if (!panning) onClick?.();
+    };
+    scroll.addEventListener('pointermove', move);
+    scroll.addEventListener('pointerup', up);
+    scroll.addEventListener('pointercancel', end);
   }
 
   setHeight(height) {
@@ -227,14 +306,14 @@ export class Timeline {
         if (!paths.length || paths.some((p) => p.toLowerCase().endsWith('.wvm'))) return;
         e.preventDefault();
         e.stopPropagation();
-        this.placeFiles(paths, e.clientX, e.clientY);
+        this.placeFiles(paths, e.clientX, e.clientY).then(() => this.fit());
         return;
       }
       if (!kind) return;
       e.preventDefault();
       const mediaId = e.dataTransfer.getData(`application/x-wvm-${kind}`);
       const track = this.dropTrack(kind, e.clientY);
-      if (mediaId && track) placeOnTrack(mediaId, track.id, this.snapTime(this.timeAt(e.clientX), null));
+      if (mediaId && track && placeOnTrack(mediaId, track.id, this.snapTime(this.timeAt(e.clientX), null))) this.fit();
     });
   }
 
@@ -248,12 +327,76 @@ export class Timeline {
     return Math.max(0, (clientX - r.left) / this.zoom);
   }
 
-  setZoom(z) {
-    // 재생 위치가 화면에서 움직이지 않도록 스크롤을 보정한다
-    const viewX = this.preview.time * this.zoom - this.scroll.scrollLeft;
-    this.zoom = z;
+  /** 프로젝트 전체가 한 화면에 들어가는 배율 */
+  fitZoom() {
+    const total = projectDuration(store.project);
+    const width = this.scroll.clientWidth - FIT_TAIL_PX;
+    if (total <= 0 || width <= 0) return INITIAL_ZOOM;
+    return Math.min(MAX_ZOOM, width / total);
+  }
+
+  /** 아무리 긴 영상도 전체를 볼 수 있도록 영상 길이에 따라 내려간다 */
+  minZoom() {
+    return Math.min(COMFORT_MIN_ZOOM, this.fitZoom());
+  }
+
+  zoomFromSlider(v) {
+    const min = this.minZoom();
+    return min * (MAX_ZOOM / min) ** (v / 100);
+  }
+
+  sliderFromZoom(z) {
+    const min = this.minZoom();
+    return (Math.log(z / min) / Math.log(MAX_ZOOM / min)) * 100;
+  }
+
+  clampZoom(z) {
+    return Math.min(MAX_ZOOM, Math.max(this.minZoom(), z));
+  }
+
+  /** anchorX(화면 좌표) 아래의 시각이 움직이지 않게 확대한다. 없으면 재생 위치를 기준으로 한다 */
+  setZoom(z, anchorX = null) {
+    const viewLeft = this.scroll.getBoundingClientRect().left;
+    const time = anchorX === null ? this.preview.time : this.timeAt(anchorX);
+    const viewX = anchorX === null ? time * this.zoom - this.scroll.scrollLeft : anchorX - viewLeft;
+    this.zoom = this.clampZoom(z);
     this.render();
-    this.scroll.scrollLeft = this.preview.time * z - viewX;
+    this.scroll.scrollLeft = time * this.zoom - viewX;
+    this.repaintLongClips(true);
+  }
+
+  /** 프로젝트 전체가 보이게 맞춘다 */
+  fit() {
+    this.zoom = this.clampZoom(this.fitZoom());
+    this.render();
+    this.scroll.scrollLeft = 0;
+    this.repaintLongClips(true);
+  }
+
+  /** from~to 초 구간이 화면을 채우게 맞춘다 */
+  showSpan(from, to) {
+    const client = this.scroll.clientWidth;
+    const span = Math.max(to - from, 1 / MAX_ZOOM);
+    this.zoom = this.clampZoom((client * 0.9) / span);
+    this.render();
+    this.scroll.scrollLeft = from * this.zoom - (client - span * this.zoom) / 2;
+    this.repaintLongClips(true);
+  }
+
+  /** 지정한 구간 → 선택 항목 → 전체 순으로 맞춘다 */
+  showSelection() {
+    const { in: a, out: b } = store.range;
+    const sel = store.selected();
+    if (a !== null && b !== null && b > a) this.showSpan(a, b);
+    else if (sel) this.showSpan(sel.item.start, itemEnd(sel.item));
+    else this.fit();
+  }
+
+  /** 시각 t 가 화면 밖이면 가운데로 가져온다 */
+  reveal(t) {
+    const x = t * this.zoom;
+    const { scrollLeft, clientWidth } = this.scroll;
+    if (x < scrollLeft || x > scrollLeft + clientWidth - 8) this.scroll.scrollLeft = x - clientWidth / 2;
   }
 
   updatePlayhead(t) {
@@ -287,19 +430,26 @@ export class Timeline {
     this.renderPending = false;
     const { project } = store;
     const total = projectDuration(project);
-    const width = Math.max((total + 30) * this.zoom, this.scroll.clientWidth);
-    this.content.style.width = `${width}px`;
+    const client = this.scroll.clientWidth;
+    // 전체 맞춤에서는 스크롤이 생기지 않게 하고, 확대하면 끝 뒤에 놓을 자리를 둔다
+    const tail = this.zoom <= this.fitZoom() * 1.01 ? FIT_TAIL_PX : client / 2;
+    this.content.style.width = `${Math.max(total * this.zoom + tail, client)}px`;
+    this.longClips = [];
 
     // 트랙 추가 버튼은 스크롤과 상관없이 보이도록 눈금자 왼쪽 칸에 둔다
-    this.headers.replaceChildren(el('div', { id: 'tlCorner' },
+    // 다시 그려도 같은 요소를 써서 누르는 도중에 클릭이 사라지지 않게 한다
+    this.corner ??= el('div', { id: 'tlCorner' },
       el('button', { text: '+비디오', title: '비디오 트랙 추가', onclick: () => addTrack('video') }),
-      el('button', { text: '+오디오', title: '오디오 트랙 추가', onclick: () => addTrack('audio') })));
+      el('button', { text: '+오디오', title: '오디오 트랙 추가', onclick: () => addTrack('audio') }));
+    this.headers.replaceChildren(this.corner);
     this.rows.replaceChildren();
     project.tracks.forEach((track) => {
       this.headers.append(this.renderHeader(track));
       this.rows.append(this.renderRow(track));
     });
     this.rows.append(el('div', { style: 'height:8px' }));
+    this.zoomInput.value = this.sliderFromZoom(this.zoom);
+    this.lastPaintLeft = this.scroll.scrollLeft;
     this.drawRuler();
     this.updatePlayhead(this.preview.time);
     this.updateRange();
@@ -343,8 +493,12 @@ export class Timeline {
     });
     node.dataset.itemId = item.id;
 
-    if (media && track.type === 'video') this.addThumbs(node, item, media, width);
-    if (media && media.hasAudio) this.addWave(node, item, media, width, track);
+    if (media) {
+      const paint = () => this.paintClip(node, track, item, media, width);
+      paint();
+      // 화면보다 긴 클립은 보이는 부분만 그리므로 스크롤하면 다시 그린다
+      if (width > this.scroll.clientWidth) this.longClips.push(paint);
+    }
     node.append(el('span', { class: 'label', text: itemLabel(track, item, media) }));
     if (media && item.speed !== 1) node.append(el('span', { class: 'badge', text: `${item.speed}배속` }));
     if (item.fadeIn > 0) node.append(el('div', { class: 'fade in', style: `width:${item.fadeIn * this.zoom}px` }));
@@ -355,49 +509,86 @@ export class Timeline {
     return node;
   }
 
-  addThumbs(node, item, media, width) {
+  /** 클립 왼쪽 기준으로 화면 근처에 해당하는 구간(px). 앞뒤로 한 화면씩 여유를 둔다 */
+  visibleSpan(item, width) {
+    const client = this.scroll.clientWidth;
+    const local = this.scroll.scrollLeft - item.start * this.zoom;
+    return { from: Math.max(0, local - client), to: Math.min(width, local + client * 2) };
+  }
+
+  paintClip(node, track, item, media, width) {
+    node.querySelectorAll(':scope > .thumbs, :scope > .wave').forEach((n) => n.remove());
+    const span = this.visibleSpan(item, width);
+    if (span.to <= span.from) return;
+    const wave = media.hasAudio ? this.buildWave(item, media, width, track, span) : null;
+    if (wave) node.prepend(wave);
+    const thumbs = track.type === 'video' ? this.buildThumbs(item, media, width, span) : null;
+    if (thumbs) node.prepend(thumbs);
+  }
+
+  repaintLongClips(force = false) {
+    if (!this.longClips.length) return;
+    const left = this.scroll.scrollLeft;
+    if (!force && Math.abs(left - this.lastPaintLeft) < this.scroll.clientWidth / 2) return;
+    this.lastPaintLeft = left;
+    if (this.paintFrame) return;
+    this.paintFrame = requestAnimationFrame(() => {
+      this.paintFrame = null;
+      this.longClips.forEach((paint) => paint());
+    });
+  }
+
+  buildThumbs(item, media, width, span) {
     const rt = store.rt(media.id);
-    if (!rt.sprite) return;
+    if (!rt.sprite) return null;
     const box = el('div', { class: 'thumbs' });
     const url = `url("${mediaUrl(rt.sprite)}")`;
     const h = ROW_H.video - 6;
     const w = (h * 16) / 9;
     const cell = Math.max(w, THUMB_W);
-    const shown = Math.min(40, Math.ceil(width / cell));
     const frames = rt.spriteCount;
-    for (let i = 0; i < shown; i += 1) {
+    const first = Math.floor(span.from / cell);
+    const last = Math.ceil(span.to / cell);
+    for (let i = first; i < last; i += 1) {
       const srcT = media.type === 'image' ? 0 : item.in + ((i * cell) / width) * (item.out - item.in);
       const index = media.type === 'image' ? 0 : Math.min(frames - 1, Math.floor((srcT / media.duration) * frames));
-      const thumb = el('i', { style: `width:${cell}px` });
+      const thumb = el('i', { style: `left:${i * cell}px;width:${cell}px` });
       thumb.style.backgroundImage = url;
       thumb.style.backgroundSize = `${w * frames}px ${h}px`;
       thumb.style.backgroundPosition = `${-index * w}px 0`;
       box.append(thumb);
     }
-    node.append(box);
+    return box;
   }
 
-  addWave(node, item, media, width, track) {
+  buildWave(item, media, width, track, span) {
     const peaks = store.rt(media.id).peaks;
     if (!peaks) {
       ensurePeaks(media);
-      return;
+      return null;
     }
     const height = track.type === 'video' ? 20 : ROW_H.audio - 6;
-    const w = Math.min(Math.ceil(width), 4000);
+    const w = Math.ceil(span.to - span.from);
     const canvas = el('canvas', { class: 'wave', width: w, height });
+    canvas.style.left = `${span.from}px`;
+    canvas.style.width = `${w}px`;
     if (track.type === 'video') { canvas.style.height = `${height}px`; }
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = track.type === 'video' ? '#b8f0d8cc' : '#d9fff0';
     const { rate, data } = peaks;
+    const secondsPerPx = (item.out - item.in) / width;
     for (let x = 0; x < w; x += 1) {
-      const t = item.in + (x / w) * (item.out - item.in);
+      const t = item.in + (span.from + x) * secondsPerPx;
+      // 축소하면 한 픽셀에 여러 피크가 들어가므로 가장 큰 값을 쓴다
       const i = Math.floor(t * rate);
-      const v = (data[i] || 0) / 255;
+      const end = Math.max(i + 1, Math.floor((t + secondsPerPx) * rate));
+      let peak = 0;
+      for (let j = i; j < end; j += 1) if (data[j] > peak) peak = data[j];
+      const v = peak / 255;
       const bar = Math.max(1, v * height * (item.muted ? 0.2 : Math.min(1, item.volume)));
       ctx.fillRect(x, height - bar, 1, bar);
     }
-    node.append(canvas);
+    return canvas;
   }
 
   drawRuler() {
@@ -412,8 +603,8 @@ export class Timeline {
     const ctx = canvas.getContext('2d');
     ctx.font = '10px Consolas, monospace';
     ctx.textBaseline = 'top';
-    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
-    const major = steps.find((s) => s * this.zoom >= 80) || 3600;
+    const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400];
+    const major = steps.find((s) => s * this.zoom >= 80) || 86400;
     const minor = major / 5;
     const first = Math.floor(left / this.zoom / minor) * minor;
     for (let t = first; t * this.zoom < left + w; t += minor) {
@@ -426,7 +617,7 @@ export class Timeline {
       ctx.stroke();
       if (isMajor) {
         ctx.fillStyle = '#b6bccb';
-        ctx.fillText(formatHMS(t), x + 3, 2);
+        ctx.fillText(major < 1 ? formatPrecise(t) : formatHMS(t), x + 3, 2);
       }
     }
   }

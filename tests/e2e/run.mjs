@@ -145,7 +145,9 @@ const rowCenter = async (name) => {
       if (!row) return null;
       row.scrollIntoView({ block: 'nearest' });
       const r = row.getBoundingClientRect();
-      return { x: r.x, y: r.y, height: r.height };
+      // 가로로 스크롤되어 있으면 줄의 왼쪽 끝은 화면 밖이다
+      const left = document.getElementById('tlScroll').getBoundingClientRect().left;
+      return { x: Math.max(r.x, left), y: r.y, height: r.height };
     }, id);
     if (box) return { x: box.x + 200, y: box.y + box.height / 2 };
     await page.waitForTimeout(50);
@@ -552,6 +554,198 @@ await step('트림 핸들로 길이 조절', async () => {
   const trimmed = track(await projectState(), '음악').clips[0];
   assert.ok(trimmed.out < 30, `끝 ${trimmed.out}`);
   await evalApp(() => window.__wvm.store.undo());
+});
+
+const view = () => evalApp(() => {
+  const s = document.getElementById('tlScroll');
+  const { timeline, preview } = window.__wvm;
+  return { zoom: timeline.zoom, left: s.scrollLeft, top: s.scrollTop, width: s.scrollWidth, client: s.clientWidth, time: preview.time, duration: preview.duration, fit: timeline.fitZoom() };
+});
+const timeUnder = (x) => evalApp((cx) => window.__wvm.timeline.timeAt(cx), x);
+const scrollArea = () => page.locator('#tlScroll').boundingBox();
+
+await step('타임라인: 휠로 마우스 위치 기준 확대·축소, Shift+휠로 좌우 이동', async () => {
+  await evalApp(() => window.__wvm.timeline.fit());
+  const area = await scrollArea();
+  const x = area.x + 500;
+  const y = area.y + 60;
+  await page.mouse.move(x, y);
+  const before = await view();
+  const anchor = await timeUnder(x);
+  await page.mouse.wheel(0, -400);
+  await page.waitForTimeout(150);
+  const zoomed = await view();
+  assert.ok(zoomed.zoom > before.zoom * 1.5, `확대 ${before.zoom} → ${zoomed.zoom}`);
+  assert.ok(Math.abs(await timeUnder(x) - anchor) < 0.2, `마우스 아래 시각 유지 ${anchor}`);
+  await page.keyboard.down('Shift');
+  await page.mouse.wheel(0, 200);
+  await page.keyboard.up('Shift');
+  await page.waitForTimeout(100);
+  assert.ok((await view()).left > zoomed.left, 'Shift+휠 좌우 이동');
+  assert.ok(Math.abs((await view()).zoom - zoomed.zoom) < 1e-6, 'Shift+휠은 배율을 바꾸지 않음');
+  await page.mouse.wheel(0, 3000);
+  await page.waitForTimeout(150);
+  const out = await view();
+  assert.ok(out.zoom < zoomed.zoom, '축소');
+  await evalApp(() => window.__wvm.timeline.fit());
+});
+
+await step('타임라인: 빈 곳·가운데 버튼 끌기로 화면 이동, 클릭은 위치 이동', async () => {
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(timeline.zoom * 8); document.getElementById('tlScroll').scrollLeft = 2000; });
+  const rowBox = await rowCenter('자막');
+  const start = await view();
+  await page.mouse.move(rowBox.x + 400, rowBox.y);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.move(rowBox.x + 100, rowBox.y, { steps: 4 });
+  await page.mouse.up({ button: 'middle' });
+  const middle = await view();
+  assert.ok(Math.abs(middle.left - (start.left + 300)) < 3, `가운데 버튼 ${start.left} → ${middle.left}`);
+  assert.equal(middle.time, start.time, '끌기는 재생 위치를 바꾸지 않음');
+  await page.mouse.move(rowBox.x + 100, rowBox.y);
+  await page.mouse.down();
+  await page.mouse.move(rowBox.x + 400, rowBox.y, { steps: 4 });
+  await page.mouse.up();
+  const left = await view();
+  assert.ok(Math.abs(left.left - middle.left + 300) < 3, `빈 곳 끌기 ${middle.left} → ${left.left}`);
+  assert.equal(left.time, start.time);
+  await page.mouse.move(rowBox.x + 300, rowBox.y);
+  const expected = await timeUnder(rowBox.x + 300);
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.waitForTimeout(50);
+  assert.ok(Math.abs((await view()).time - expected) < 0.05, '클릭은 위치 이동');
+  await evalApp(() => { window.__wvm.preview.seek(0); window.__wvm.timeline.fit(); });
+});
+
+await step('타임라인: 미디어를 끌어다 놓으면 전체가 보이게 맞춘다', async () => {
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(timeline.zoom * 20); document.getElementById('tlScroll').scrollLeft = 500; });
+  assert.ok((await view()).width > (await view()).client * 2);
+  const { x, y } = await rowCenter('V2');
+  await dragCard('가로영상.mp4', x, y);
+  const v = await view();
+  assert.ok(v.width <= v.client + 1, `가로 스크롤 없음 ${v.width}/${v.client}`);
+  assert.equal(v.left, 0);
+  const lastRight = await evalApp(() => Math.max(...[...document.querySelectorAll('#tlRows .clip')].map((n) => n.getBoundingClientRect().right)));
+  const area = await scrollArea();
+  assert.ok(lastRight <= area.x + area.width, `모든 클립이 화면 안 ${lastRight}`);
+  await undoAll(1);
+  // 더블클릭으로 붙여도 맞춘다
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(timeline.zoom * 20); });
+  await page.locator('.media-card', { hasText: 'portrait.mp4' }).dblclick();
+  const dbl = await view();
+  assert.ok(dbl.width <= dbl.client + 1, '더블클릭 후 전체 보기');
+  await undoAll(1);
+});
+
+await step('타임라인: 구간 이동과 전체·선택 보기', async () => {
+  await evalApp(() => { window.__wvm.preview.seek(0); window.__wvm.timeline.fit(); });
+  const edges = await evalApp(() => {
+    const { store } = window.__wvm;
+    const set = new Set([0]);
+    for (const t of store.project.tracks) {
+      if (t.type === 'caption') continue;
+      for (const c of t.clips) { set.add(c.start); set.add(c.start + (c.duration ?? (c.out - c.in) / c.speed)); }
+    }
+    return [...set].sort((a, b) => a - b);
+  });
+  assert.ok(edges.length >= 3, `경계 ${edges}`);
+  await page.locator('#tlNextSection').click();
+  assert.ok(Math.abs((await view()).time - edges[1]) < 1e-3, '다음 구간 버튼');
+  await page.locator('#tlNextSection').click();
+  assert.ok(Math.abs((await view()).time - edges[2]) < 1e-3, '또 다음 구간');
+  await page.locator('#tlPrevSection').click();
+  assert.ok(Math.abs((await view()).time - edges[1]) < 1e-3, '이전 구간 버튼');
+  await page.keyboard.press('PageDown');
+  assert.ok(Math.abs((await view()).time - edges[2]) < 1e-3, 'PageDown');
+  await page.keyboard.press('PageUp');
+  assert.ok(Math.abs((await view()).time - edges[1]) < 1e-3, 'PageUp');
+  // 확대해서 경계가 화면 밖이면 따라간다
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(600); document.getElementById('tlScroll').scrollLeft = 0; window.__wvm.preview.seek(0); });
+  await page.locator('#tlNextSection').click();
+  const followed = await view();
+  const x = followed.time * followed.zoom;
+  assert.ok(x >= followed.left && x <= followed.left + followed.client, `재생 위치가 화면 안 ${x} / ${followed.left}`);
+  // 선택 보기: 선택한 클립이 화면을 채운다
+  const clipId = await evalApp(() => {
+    const { store } = window.__wvm;
+    const clip = store.project.tracks.find((t) => t.name === '음악').clips[0];
+    store.select(clip.id);
+    return clip.id;
+  });
+  await page.locator('#tlShowSelection').click();
+  await waitFrame();
+  const box = await page.locator(`.clip[data-item-id="${clipId}"]`).boundingBox();
+  const area = await scrollArea();
+  assert.ok(box.width > area.width * 0.8 && box.x >= area.x - 1 && box.x + box.width <= area.x + area.width + 1, `선택 보기 ${JSON.stringify(box)}`);
+  await evalApp(() => { window.__wvm.store.select(null); });
+  await page.locator('#tlFit').click();
+  const fitted = await view();
+  assert.ok(fitted.width <= fitted.client + 1, '전체 보기');
+  await evalApp(() => window.__wvm.preview.seek(0));
+});
+
+await step('타임라인: 3시간 영상도 전체를 한 화면에 보고 프레임 단위까지 확대한다', async () => {
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc=s=320x180:r=10:d=10', '-f', 'lavfi', '-i', 'sine=f=300:r=8000:d=10',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-g', '100', '-c:a', 'aac', '-shortest', f('ten.mp4')]);
+  await run(FFMPEG, ['-y', '-stream_loop', '1079', '-i', f('ten.mp4'), '-c', 'copy', f('long3h.mp4')]);
+  const [m] = await evalApp((p) => window.__wvm.actions.importPaths([p]).then((r) => r.map((x) => ({ id: x.id, duration: x.duration }))), f('long3h.mp4'));
+  assert.ok(m.duration > 10700, `길이 ${m.duration}`);
+  const before = await evalApp(() => window.__wvm.store.past.length);
+  const cleanup = () => evalApp(([n, id]) => {
+    const { store, actions, timeline } = window.__wvm;
+    while (store.past.length > n) store.undo();
+    actions.removeMedia(id);
+    store.select(null);
+    timeline.fit();
+  }, [before, m.id]);
+  try {
+  const clipId = await evalApp((id) => {
+    const { store, actions } = window.__wvm;
+    const track = store.project.tracks.find((t) => t.name === 'V2');
+    const clip = actions.placeOnTrack(id, track.id, 0);
+    window.__wvm.timeline.fit();
+    return clip.id;
+  }, m.id);
+  const fitted = await view();
+  assert.ok(fitted.zoom < 0.2, `배율 ${fitted.zoom}`);
+  assert.ok(fitted.width <= fitted.client + 1, '3시간 전체가 한 화면');
+  const node = page.locator(`.clip[data-item-id="${clipId}"]`);
+  const box = await node.boundingBox();
+  const area = await scrollArea();
+  assert.ok(box.x + box.width <= area.x + area.width, '클립 끝까지 보임');
+  await shot('long-fit');
+  // 가장 많이 확대해도 뒤쪽 썸네일이 그려진다
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(1200); document.getElementById('tlScroll').scrollLeft = 9000 * 1200; });
+  await page.waitForFunction((id) => window.__wvm.store.rt(id).sprite, m.id, { timeout: 60000 });
+  await page.waitForTimeout(400);
+  const zoomed = await view();
+  assert.equal(zoomed.zoom, 1200);
+  assert.ok(Math.abs(zoomed.left - 9000 * 1200) < 5, `3시간 영상 중간으로 이동 ${zoomed.left}`);
+  const visuals = await evalApp((id) => {
+    const clip = document.querySelector(`.clip[data-item-id="${id}"]`);
+    const view = document.getElementById('tlScroll').getBoundingClientRect();
+    const cells = [...clip.querySelectorAll('.thumbs i')];
+    const shown = cells.filter((c) => { const r = c.getBoundingClientRect(); return r.right > view.left && r.left < view.right; });
+    return { total: cells.length, shown: shown.length, wave: clip.querySelector('.wave')?.getBoundingClientRect().width ?? 0 };
+  }, clipId);
+  assert.ok(visuals.shown > 0, `화면에 보이는 썸네일 ${JSON.stringify(visuals)}`);
+  assert.ok(visuals.total < 200, `보이는 부분만 그림 ${visuals.total}`);
+  await shot('long-zoomed');
+  // 스크롤해도 따라 그린다
+  await evalApp(() => { document.getElementById('tlScroll').scrollLeft = 2000 * 1200; });
+  await page.waitForTimeout(300);
+  const moved = await evalApp((id) => {
+    const clip = document.querySelector(`.clip[data-item-id="${id}"]`);
+    const view = document.getElementById('tlScroll').getBoundingClientRect();
+    return [...clip.querySelectorAll('.thumbs i')].filter((c) => { const r = c.getBoundingClientRect(); return r.right > view.left && r.left < view.right; }).length;
+  }, clipId);
+  assert.ok(moved > 0, `스크롤 후 썸네일 ${moved}`);
+  // 축소 한계는 전체 맞춤 배율까지 내려간다
+  await evalApp(() => { const { timeline } = window.__wvm; timeline.setZoom(0.0001); });
+  assert.ok(Math.abs((await view()).zoom - fitted.zoom) < 1e-6, '최소 배율은 전체 맞춤');
+  } finally {
+    await cleanup();
+  }
 });
 
 await step('페이드 속성을 패널에서 입력', async () => {
