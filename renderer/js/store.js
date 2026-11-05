@@ -14,7 +14,7 @@ export const store = {
   dirty: false,
   selection: null, // 선택한 타임라인 항목 id
   range: { in: null, out: null },
-  /** mediaId → { proxy, playable, forceProxy, checking, exportPath, sprite, spriteCount, peaks, missing, proxyProgress } (저장하지 않음) */
+  /** mediaId → { engine, proxy, playable, forceProxy, checking, exportPath, sprite, spriteCount, peaks, missing, proxyProgress } (저장하지 않음) */
   runtime: new Map(),
   clipboard: null,
   /** 미디어함에서 끌고 있는 미디어 id */
@@ -137,6 +137,7 @@ export const mediaUrl = (path) => `media://local/${encodeURIComponent(path)}`;
 export function previewPath(media) {
   const rt = store.rt(media.id);
   if (rt.missing) return null;
+  if (rt.engine === 'mpv') return media.path;
   if (rt.proxy) return rt.proxy;
   if (rt.forceProxy || (media.needsProxy && !rt.playable)) return null;
   return rt.exportPath || media.path;

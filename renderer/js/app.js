@@ -2,6 +2,7 @@
 
 import * as actions from './actions.js';
 import { bindExportDialog, prepareAssets } from './exportDialog.js';
+import { initMpv } from './mpvPlayer.js';
 import { bindPanels, setTab } from './panels.js';
 import { attachStageInteractions, bindTransport, Preview } from './preview.js';
 import { bindProperties } from './properties.js';
@@ -11,6 +12,7 @@ import { loadSystemFonts, toast } from './ui.js';
 
 const AUTOSAVE_MS = 30000;
 
+initMpv();
 const preview = new Preview(document.getElementById('preview'));
 actions.setPreview(preview);
 const transport = bindTransport(preview);

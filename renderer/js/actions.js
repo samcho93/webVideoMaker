@@ -6,6 +6,7 @@ import {
 } from '/shared/model.mjs';
 import { splitMaskKeyframes } from '/shared/layout.mjs';
 import { parseNarration, parseSrt, serializeNarration, serializeSrt } from '/shared/narration.mjs';
+import { mpvAvailable, whenMpvReady } from './mpvPlayer.js';
 import { mediaUrl, store } from './store.js';
 import { toast } from './ui.js';
 
@@ -18,6 +19,12 @@ export const playhead = () => preview.time;
 export const seekTo = (t) => preview.seek(t);
 
 // ── 미디어 ──
+
+// 브라우저가 해독할 수 있는 코덱. 그 밖의 형식은 시험 없이 바로 libmpv 로 재생한다
+const BROWSER_CODECS = new Set(['h264', 'hevc', 'vp8', 'vp9', 'av1', 'aac', 'mp3', 'opus', 'vorbis', 'flac', 'pcm_s16le', 'pcm_s24le', 'pcm_f32le', 'pcm_u8']);
+let mpvEnabled = true;
+/** 변환 방식 시험용 */
+export const setMpvEnabled = (value) => { mpvEnabled = value; };
 
 const peaksRequested = new Set();
 const proxyStarted = new Set();
@@ -112,13 +119,26 @@ async function buildProxy(media, info, { transcode = false } = {}) {
   }
 }
 
-/** 원본이 바로 재생되면 변환하지 않는다. 안 되면 가장 빠른 방법으로 미리보기 파일을 만든다 */
+async function useMpv(media) {
+  if (!mpvEnabled || store.rt(media.id).mpvFailed || !await whenMpvReady()) return false;
+  store.setRuntime(media.id, { engine: 'mpv', forceProxy: false, playable: false });
+  return true;
+}
+
+/**
+ * 재생 준비. 브라우저가 해독할 수 있는 형식이면 시험해서 그대로 쓰고,
+ * 아니면 변환 없이 libmpv 로 바로 재생한다. libmpv 를 쓸 수 없을 때만 미리보기 파일을 만든다.
+ */
 async function preparePreview(media, info) {
   if (media.type !== 'image') {
-    store.setRuntime(media.id, { checking: true });
-    const playable = await testPlayback(media.path, info);
-    store.setRuntime(media.id, { checking: false, playable });
-    if (playable) return;
+    const codecs = [media.videoCodec, media.audioCodec].filter(Boolean);
+    if (codecs.every((c) => BROWSER_CODECS.has(c))) {
+      store.setRuntime(media.id, { checking: true });
+      const playable = await testPlayback(media.path, info);
+      store.setRuntime(media.id, { checking: false, playable });
+      if (playable) return;
+    }
+    if (await useMpv(media)) return;
   }
   proxyStarted.add(media.id);
   await buildProxy(media, info);
@@ -128,6 +148,19 @@ async function preparePreview(media, info) {
 export function reportPlaybackError(media, path) {
   const rt = store.rt(media.id);
   if (rt.proxyFailed || rt.missing) return;
+  if (rt.engine === 'mpv') {
+    // libmpv 도 실패하면 변환 방식으로 넘어간다
+    store.setRuntime(media.id, { engine: null, mpvFailed: true, forceProxy: true });
+    if (!proxyStarted.has(media.id)) {
+      proxyStarted.add(media.id);
+      buildProxy(media, { ...media });
+    }
+    return;
+  }
+  if (mpvEnabled && mpvAvailable() && !rt.mpvFailed && !rt.proxy) {
+    store.setRuntime(media.id, { engine: 'mpv', forceProxy: false, playable: false });
+    return;
+  }
   const proxyBroke = rt.proxy && rt.proxy === path;
   if (proxyBroke && !rt.retranscoded) {
     store.setRuntime(media.id, { proxy: null, forceProxy: true, retranscoded: true });

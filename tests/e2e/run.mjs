@@ -90,7 +90,7 @@ await step('여러 형식의 미디어 가져오기 (세로·사진·음악·프
   assert.equal(p.media.find((m) => m.name === 'legacy.avi').needsProxy, true);
   await page.waitForFunction(() => {
     const { store } = window.__wvm;
-    return store.project.media.every((m) => (m.type === 'audio' || store.rt(m.id).spriteCount > 0) && (!m.needsProxy || store.rt(m.id).proxy || store.rt(m.id).playable));
+    return store.project.media.every((m) => (m.type === 'audio' || store.rt(m.id).spriteCount > 0) && (!m.needsProxy || store.rt(m.id).proxy || store.rt(m.id).playable || store.rt(m.id).engine === 'mpv'));
   }, null, { timeout: 60000 });
   assert.equal(await page.locator('.media-card').count(), 5);
 });
@@ -330,7 +330,142 @@ await step('클립을 끄는 도중 썸네일이 도착해도 끌기가 이어�
   await undoAll(2);
 });
 
+await step('libmpv: 브라우저가 못 여는 형식을 변환 없이 바로 재생하고 합성한다', async () => {
+  await page.waitForFunction(async () => {
+    const m = await import('/js/mpvPlayer.js');
+    return m.mpvAvailable();
+  }, null, { timeout: 30000 });
+  const makers = {
+    'lib-ac3.mts': ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-f', 'mpegts'],
+    'lib-mpeg2.mpg': ['-c:v', 'mpeg2video', '-c:a', 'mp2'],
+    'lib-wmv.wmv': ['-c:v', 'wmv2', '-c:a', 'wmav2'],
+    'lib-prores.mov': ['-c:v', 'prores_ks', '-c:a', 'pcm_s16le'],
+    'lib-한글 이름 (1) #&%.avi': ['-c:v', 'mpeg4', '-c:a', 'libmp3lame'],
+  };
+  for (const [name, args] of Object.entries(makers)) {
+    await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'testsrc2=s=640x360:r=30:d=4', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=4', ...args, '-shortest', f(name)]);
+  }
+  await run(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'sine=f=440:r=48000:d=4', '-c:a', 'wmav2', f('lib-audio.wma')]);
+  const undoBase = await evalApp(() => window.__wvm.store.past.length);
+  const colorCount = () => evalApp(() => {
+    const c = document.getElementById('preview');
+    const data = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    const seen = new Set();
+    for (let i = 0; i < data.length; i += 4000) seen.add((data[i] >> 4) << 8 | (data[i + 1] >> 4) << 4 | (data[i + 2] >> 4));
+    return seen.size;
+  });
+  for (const name of Object.keys(makers)) {
+    const started = Date.now();
+    const id = await evalApp(async (file) => {
+      const { store, actions } = window.__wvm;
+      const [media] = await actions.importPaths([file]);
+      const track = store.project.tracks.find((t) => t.name === 'V2');
+      const start = window.__wvm.preview.duration + 1;
+      actions.placeOnTrack(media.id, track.id, start);
+      window.__wvm.preview.seek(start + 2);
+      return media.id;
+    }, f(name));
+    await page.waitForFunction((mediaId) => {
+      const { store, preview } = window.__wvm;
+      const slot = [...preview.slots.values()].find((s) => s.el.canvas);
+      return store.rt(mediaId).engine === 'mpv' && slot && slot.el.readyState >= 2 && !slot.el.seeking;
+    }, id, { timeout: 20000 });
+    await waitFrame();
+    const rt = await evalApp((mediaId) => ({ ...window.__wvm.store.rt(mediaId), peaks: null }), id);
+    assert.equal(rt.proxy ?? null, null, `${name}: 변환 파일 없이 재생`);
+    const colors = await colorCount();
+    assert.ok(colors > 8, `${name}: 화면에 그려짐 (색 ${colors})`);
+    console.log(`   ${name}: ${Date.now() - started}ms`);
+  }
+  // 재생하면 시간이 흐르고, 탐색한 시각의 프레임이 나온다
+  await evalApp(() => window.__wvm.preview.play());
+  await page.waitForTimeout(1200);
+  const during = await evalApp(() => {
+    const { preview } = window.__wvm;
+    const slot = [...preview.slots.values()].find((s) => s.el.canvas);
+    return { time: slot?.el.time, paused: slot?.el.paused, playing: preview.playing };
+  });
+  await evalApp(() => window.__wvm.preview.pause());
+  assert.ok(during.playing && during.paused === false, `재생 중 ${JSON.stringify(during)}`);
+  assert.ok(during.time > 2.3, `재생 위치가 흐름 ${during.time}`);
+  // 같은 시각에 다시 탐색하면 같은 프레임, 다른 시각이면 다른 프레임이다
+  const frameAt = async (local) => {
+    await evalApp((t) => {
+      const { store, preview } = window.__wvm;
+      const clip = store.project.tracks.find((x) => x.name === 'V2').clips.at(-1);
+      preview.seek(clip.start + t);
+    }, local);
+    await page.waitForFunction(() => {
+      const slot = [...window.__wvm.preview.slots.values()].find((s) => s.el.canvas);
+      return slot && !slot.el.seeking && slot.el.readyState >= 2;
+    }, null, { timeout: 10000 });
+    await page.waitForTimeout(400);
+    return evalApp(() => {
+      const c = document.getElementById('preview');
+      const { data } = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+      let hash = 0;
+      for (let i = 0; i < data.length; i += 997) hash = (hash * 31 + data[i]) % 1000000007;
+      return hash;
+    });
+  };
+  const a1 = await frameAt(1);
+  const b = await frameAt(3);
+  const a2 = await frameAt(1);
+  assert.equal(a1, a2, '같은 시각은 같은 프레임');
+  assert.notEqual(a1, b, '다른 시각은 다른 프레임');
+  await shot('libmpv-preview');
+  // 소리만 있는 형식
+  const audioId = await evalApp(async (file) => {
+    const { store, actions } = window.__wvm;
+    const [media] = await actions.importPaths([file]);
+    actions.placeOnTrack(media.id, store.project.tracks.find((t) => t.name === '나레이션 음성').id, 0);
+    return media.id;
+  }, f('lib-audio.wma'));
+  await page.waitForFunction((id) => window.__wvm.store.rt(id).engine === 'mpv', audioId, { timeout: 15000 });
+  // 내보내기는 FFmpeg 이 원본으로 처리하므로 프로젝트에 영향이 없다
+  await evalApp(([n, ids]) => {
+    const { store, actions } = window.__wvm;
+    while (store.past.length > n) store.undo();
+    for (const m of [...store.project.media]) if (m.name.startsWith('lib-')) actions.removeMedia(m.id);
+    window.__wvm.preview.seek(0);
+    window.__wvm.timeline.fit();
+  }, [undoBase]);
+});
+
+await step('libmpv 가 실패하면 변환 방식으로 넘어간다', async () => {
+  const id = await evalApp(async (file) => {
+    const { store, actions } = window.__wvm;
+    const [media] = await actions.importPaths([file]);
+    return media.id;
+  }, f('legacy.avi'));
+  await page.waitForFunction((mediaId) => window.__wvm.store.rt(mediaId).engine === 'mpv' || window.__wvm.store.rt(mediaId).proxy, id, { timeout: 15000 });
+  const undoBase = await evalApp(() => window.__wvm.store.past.length);
+  await evalApp((mediaId) => {
+    const { store, actions, preview } = window.__wvm;
+    const start = preview.duration + 1;
+    actions.placeOnTrack(mediaId, store.project.tracks.find((t) => t.name === 'V2').id, start);
+    preview.seek(start + 1);
+  }, id);
+  await page.waitForFunction(() => [...window.__wvm.preview.slots.values()].some((s) => s.el.canvas), null, { timeout: 15000 });
+  await evalApp(() => {
+    const slot = [...window.__wvm.preview.slots.values()].find((s) => s.el.canvas);
+    slot.el.handle({ type: 'error', message: '시험' });
+  });
+  await page.waitForFunction((mediaId) => {
+    const rt = window.__wvm.store.rt(mediaId);
+    return rt.engine !== 'mpv' && rt.mpvFailed && rt.proxy;
+  }, id, { timeout: 60000 });
+  await evalApp((n) => {
+    const { store, preview, timeline } = window.__wvm;
+    while (store.past.length > n) store.undo();
+    preview.seek(0);
+    timeline.fit();
+  }, undoBase);
+});
+
 await step('형식별 가져오기: 바로 재생되면 변환하지 않고, 안 되면 옮겨 담아 빠르게 준비한다', async () => {
+  // libmpv 를 쓸 수 없는 경우의 방식을 검증한다
+  await evalApp(() => window.__wvm.actions.setMpvEnabled(false));
   await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c', 'copy', f('box.mkv')]);
   await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c:v', 'copy', '-c:a', 'ac3', '-f', 'mpegts', f('camera.mts')]);
   await run(FFMPEG, ['-y', '-i', f('가로영상.mp4'), '-c:v', 'copy', '-c:a', 'pcm_s16le', f('camera.mov')]);
@@ -373,9 +508,11 @@ await step('형식별 가져오기: 바로 재생되면 변환하지 않고, 안
   assert.ok(colors > 8, `색 ${colors}`);
   await undoAll(1);
   for (const name of names) await evalApp((id) => window.__wvm.actions.removeMedia(id), state[name].id);
+  await evalApp(() => window.__wvm.actions.setMpvEnabled(true));
 });
 
 await step('재생 중 오류가 나면 미리보기 파일로 자동 전환한다', async () => {
+  await evalApp(() => window.__wvm.actions.setMpvEnabled(false));
   const [m] = await evalApp((p) => window.__wvm.actions.importPaths([p]).then((r) => r.map((x) => ({ id: x.id }))), f('raw.mp4'));
   await evalApp((id) => window.__wvm.actions.appendToTimeline(id), m.id);
   await seek(1);
@@ -386,6 +523,7 @@ await step('재생 중 오류가 나면 미리보기 파일로 자동 전환한�
   await page.waitForFunction((id) => window.__wvm.store.rt(id).proxy, m.id, { timeout: 30000 });
   await undoAll(1);
   await evalApp((id) => window.__wvm.actions.removeMedia(id), m.id);
+  await evalApp(() => window.__wvm.actions.setMpvEnabled(true));
 });
 
 await step('읽지 못한 파일은 이유를 알려 주고, 나머지는 정상으로 들어온다', async () => {
@@ -1080,7 +1218,7 @@ await step('프로젝트 저장 후 다시 열기', async () => {
   assert.equal(track(after, '텍스트·아이콘').clips[0].text, '제목을 입력하세요');
   await page.waitForFunction(() => {
     const { store } = window.__wvm;
-    return store.project.media.every((m) => !m.needsProxy || store.rt(m.id).proxy);
+    return store.project.media.every((m) => !m.needsProxy || store.rt(m.id).proxy || store.rt(m.id).playable || store.rt(m.id).engine === 'mpv');
   }, null, { timeout: 30000 });
 });
 

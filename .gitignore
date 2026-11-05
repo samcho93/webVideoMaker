@@ -4,3 +4,4 @@ out/
 *.log
 tests/.tmp/
 .claude/settings.local.json
+vendor/

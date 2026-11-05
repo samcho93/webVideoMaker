@@ -5,6 +5,7 @@ import { findMedia, itemDuration, itemEnd, projectDuration } from '/shared/model
 import { formatFrames, formatHMS } from '/shared/time.mjs';
 import { reportPlaybackError } from './actions.js';
 import { clipFilter } from './colorFilter.js';
+import { MpvPlayer } from './mpvPlayer.js';
 import { mediaUrl, previewPath, store } from './store.js';
 import { rasterizeCaption, rasterizeOverlay } from './raster.js';
 
@@ -12,6 +13,7 @@ const PREROLL = 1.5;
 const DRIFT_PLAYING = 0.3;
 const DRIFT_PAUSED = 0.02;
 const DRAG_THRESHOLD_PX = 3;
+const MAX_IDLE_MPV_PLAYERS = 3;
 
 export class Preview {
   constructor(canvas) {
@@ -94,18 +96,22 @@ export class Preview {
     const slot = this.slots.get(clip.id);
     const path = previewPath(media);
     if (!path) return null;
-    if (slot && slot.path === path) return slot;
+    // 같은 파일이라도 재생 엔진이 바뀌면 새 요소를 쓴다
+    const key = `${store.rt(media.id).engine ?? 'browser'}|${path}`;
+    if (slot && slot.key === key) return slot;
     if (slot) this.release(clip.id);
 
-    const pool = this.free.get(path);
+    const pool = this.free.get(key);
     const el = pool?.pop() || this.createElement(media, path);
-    const fresh = { el, path, gain: el.__gain };
+    const fresh = { el, path, key, gain: el.__gain };
     this.slots.set(clip.id, fresh);
     return fresh;
   }
 
   createElement(media, path) {
-    const el = document.createElement(media.type === 'audio' ? 'audio' : 'video');
+    const useMpv = store.rt(media.id).engine === 'mpv';
+    if (useMpv) this.trimIdleMpvPlayers();
+    const el = useMpv ? new MpvPlayer(path, media.type === 'audio') : document.createElement(media.type === 'audio' ? 'audio' : 'video');
     const { id } = media;
     const failed = () => {
       // 재생 시험을 통과했어도 재생 중에 실패할 수 있다. 미리보기 파일로 바꾼다
@@ -113,10 +119,12 @@ export class Preview {
       if (current) reportPlaybackError(current, path);
       this.invalidate();
     };
-    el.crossOrigin = 'anonymous';
-    el.preload = 'auto';
-    el.playsInline = true;
-    el.src = mediaUrl(path);
+    if (!useMpv) {
+      el.crossOrigin = 'anonymous';
+      el.preload = 'auto';
+      el.playsInline = true;
+      el.src = mediaUrl(path);
+    }
     el.addEventListener('seeked', () => this.invalidate());
     el.addEventListener('loadeddata', () => {
       if (media.type === 'video' && !el.videoWidth) failed();
@@ -125,6 +133,18 @@ export class Preview {
     el.addEventListener('canplay', () => this.invalidate());
     el.addEventListener('error', failed);
     return el;
+  }
+
+  /** libmpv 재생기는 파일마다 해독기를 붙잡고 있으므로 쉬는 것은 일정 수만 남긴다 */
+  trimIdleMpvPlayers() {
+    const idle = [...this.free.entries()].filter(([key]) => key.startsWith('mpv|'));
+    let count = idle.reduce((n, [, list]) => n + list.length, 0);
+    for (const [, list] of idle) {
+      while (list.length && count >= MAX_IDLE_MPV_PLAYERS) {
+        list.shift().close();
+        count -= 1;
+      }
+    }
   }
 
   connectAudio(el) {
@@ -139,8 +159,8 @@ export class Preview {
     const slot = this.slots.get(clipId);
     if (!slot) return;
     slot.el.pause();
-    if (!this.free.has(slot.path)) this.free.set(slot.path, []);
-    this.free.get(slot.path).push(slot.el);
+    if (!this.free.has(slot.key)) this.free.set(slot.key, []);
+    this.free.get(slot.key).push(slot.el);
     this.slots.delete(clipId);
   }
 
@@ -299,19 +319,21 @@ export class Preview {
     }
     // 프록시는 원본보다 작을 수 있으므로 원본 좌표를 실제 픽셀로 환산한다
     const k = srcW / media.width;
+    // libmpv 재생기는 프레임을 자체 canvas 에 담고 있다
+    const image = source.canvas ?? source;
 
     ctx.save();
     ctx.globalAlpha = alpha;
     if (clip.blurBackground) {
       const cover = coverSize(media.width, media.height, W, H);
       ctx.filter = 'blur(30px)';
-      ctx.drawImage(source, (W - cover.w) / 2, (H - cover.h) / 2, cover.w, cover.h);
+      ctx.drawImage(image, (W - cover.w) / 2, (H - cover.h) / 2, cover.w, cover.h);
     }
     ctx.filter = clipFilter(clip, { sharpen: !this.playing });
     ctx.translate(L.cx, L.cy);
     ctx.rotate((L.angle * Math.PI) / 180);
     ctx.scale(clip.flipH ? -1 : 1, clip.flipV ? -1 : 1);
-    ctx.drawImage(source, L.sx * k, L.sy * k, L.sw * k, L.sh * k, -L.dw / 2, -L.dh / 2, L.dw, L.dh);
+    ctx.drawImage(image, L.sx * k, L.sy * k, L.sw * k, L.sh * k, -L.dw / 2, -L.dh / 2, L.dw, L.dh);
     ctx.restore();
   }
 

@@ -7,6 +7,9 @@ const subscribe = (channel) => (cb) => {
   return () => ipcRenderer.removeListener(channel, handler);
 };
 
+// MessagePort 는 contextBridge 로 넘길 수 없어 window.postMessage 로 전달한다
+ipcRenderer.on('mpv:port', (e) => window.postMessage({ type: 'wvm-mpv-port' }, '*', e.ports));
+
 contextBridge.exposeInMainWorld('api', {
   pickMedia: invoke('media:pick'),
   probe: invoke('media:probe'),
@@ -43,6 +46,7 @@ contextBridge.exposeInMainWorld('api', {
   confirm: invoke('dialog:confirm'),
   onExportProgress: subscribe('export:progress'),
   onProxyProgress: subscribe('proxy:progress'),
+  onMpvDown: subscribe('mpv:down'),
   onMenu: subscribe('menu'),
   onOpenPath: subscribe('project:openPath'),
 });

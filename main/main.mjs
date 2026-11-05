@@ -1,4 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session, shell } from 'electron';
+import {
+  app, BrowserWindow, dialog, ipcMain, Menu, MessageChannelMain, net, protocol, session, shell, utilityProcess,
+} from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -129,6 +131,36 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+let mpvHost = null;
+
+const libmpvPath = () => (app.isPackaged
+  ? path.join(process.resourcesPath, 'libmpv', 'libmpv-2.dll')
+  : path.join(ROOT, 'vendor', 'libmpv', 'libmpv-2.dll'));
+
+/** libmpv 재생 프로세스를 띄워 렌더러와 직접 연결한다. 문제가 생겨도 앱은 변환 방식으로 계속 동작한다 */
+function startMpvHost() {
+  mpvHost?.kill();
+  mpvHost = null;
+  const dll = libmpvPath();
+  if (!fs.existsSync(dll)) {
+    win?.webContents.send('mpv:down');
+    return;
+  }
+  const env = { ...process.env, WVM_LIBMPV: dll };
+  if (process.env.WVM_E2E) env.WVM_MPV_NO_AUDIO = '1';
+  const host = utilityProcess.fork(path.join(ROOT, 'main', 'mpvHost.cjs'), [], { env, serviceName: 'WebVideoMaker libmpv' });
+  mpvHost = host;
+  const { port1, port2 } = new MessageChannelMain();
+  host.postMessage({}, [port1]);
+  win?.webContents.postMessage('mpv:port', null, [port2]);
+  host.on('exit', () => {
+    if (mpvHost === host) {
+      mpvHost = null;
+      win?.webContents.send('mpv:down');
+    }
+  });
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1600,
@@ -150,6 +182,7 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('did-finish-load', () => {
+    startMpvHost();
     if (pendingOpen) {
       win.webContents.send('project:openPath', pendingOpen);
       pendingOpen = null;
@@ -168,7 +201,11 @@ function createWindow() {
     if (choice === 1) e.preventDefault();
     else fs.rmSync(autosavePath(), { force: true });
   });
-  win.on('closed', () => { win = null; });
+  win.on('closed', () => {
+    win = null;
+    mpvHost?.kill();
+    mpvHost = null;
+  });
 }
 
 async function deriveAndAllow(fn) {
